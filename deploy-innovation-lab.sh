@@ -30,14 +30,14 @@ echo "Creating Docker Hub Portkey credentials in Secrets Manager..."
 #EOF
 #)
 
-DOCKER_CREDENTIALS_RESPONSE=$(aws secretsmanager create-secret \
-    --name "portkey/docker-credentials" \
-    --description "Docker Hub credentials for Portkey images" \
-    --secret-string "${DOCKER_CREDS_JSON}" \
-    --tags Key=Environment,Value=${ENVIRONMENT} \
-    --region ${AWS_REGION})
+#DOCKER_CREDENTIALS_RESPONSE=$(aws secretsmanager create-secret \
+#    --name "portkey/docker-credentials" \
+#    --description "Docker Hub credentials for Portkey images" \
+#    --secret-string "${DOCKER_CREDS_JSON}" \
+#    --tags Key=Environment,Value=${ENVIRONMENT} \
+#    --region ${AWS_REGION})
 
-DOCKER_CREDENTIALS_SECRET_ARN=$(echo $DOCKER_CREDENTIALS_RESPONSE | jq -r '.ARN')
+#DOCKER_CREDENTIALS_SECRET_ARN=$(echo $DOCKER_CREDENTIALS_RESPONSE | jq -r '.ARN')
 
 echo "Creating ECS cluster..."
 aws ecs create-cluster \
