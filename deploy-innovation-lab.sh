@@ -40,13 +40,13 @@ echo "Creating Docker Hub Portkey credentials in Secrets Manager..."
 #DOCKER_CREDENTIALS_SECRET_ARN=$(echo $DOCKER_CREDENTIALS_RESPONSE | jq -r '.ARN')
 
 echo "Creating ECS cluster..."
-aws ecs create-cluster \
-    --cluster-name ${CLUSTER_NAME} \
-    --capacity-providers FARGATE \
-    --default-capacity-provider-strategy \
-        capacityProvider=FARGATE,weight=1,base=1 \
-    --tags key=Service,value=Portkey \
-    --region ${AWS_REGION}
+#aws ecs create-cluster \
+#    --cluster-name ${CLUSTER_NAME} \
+#    --capacity-providers FARGATE \
+#    --default-capacity-provider-strategy \
+#        capacityProvider=FARGATE,weight=1,base=1 \
+#    --tags key=Service,value=Portkey \
+#    --region ${AWS_REGION}
 
 
 # Create security groups
