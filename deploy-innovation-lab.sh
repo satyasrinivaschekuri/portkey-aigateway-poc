@@ -14,7 +14,7 @@ DOCKER_PASSWORD=throwaway@123
 AWS_REGION=us-east-1
 AWS_ACCOUNT_ID=196856463470
 VPC_ID=vpc-02d65f45df09dcd82
-SUBNET_IDS=""
+SUBNET_IDS="subnet-073e48862888f6be5subnet-0c25b09f7caf0a7e8"
 
 #ECS Cluster
 CLUSTER_NAME=portkey-ai
@@ -22,13 +22,13 @@ TASK_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
 EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
 
 echo "Creating Docker Hub Portkey credentials in Secrets Manager..."
-DOCKER_CREDS_JSON=$(cat <<EOF
-{
-    "username": "${DOCKER_USERNAME}",
-    "password": "${DOCKER_PASSWORD}"
-}
-EOF
-)
+#DOCKER_CREDS_JSON=$(cat <<EOF
+#{
+#    "username": "${DOCKER_USERNAME}",
+#    "password": "${DOCKER_PASSWORD}"
+#}
+#EOF
+#)
 
 DOCKER_CREDENTIALS_RESPONSE=$(aws secretsmanager create-secret \
     --name "portkey/docker-credentials" \
