@@ -57,7 +57,7 @@ PORTKEY_SG_RESPONSE=$(aws ec2 create-security-group \
     --group-name portkey-sg \
     --description "Security group for Portkey" \
     --vpc-id ${VPC_ID} \
-    --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-sg}, {Key=Environment,Value=${ENVIRONMENT}}]' \
+    --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-sg}, {Key=Environment,Value=portkey-poc-innovation-lab}]' \
     --region ${AWS_REGION})
 
 PORTKEY_SECURITY_GROUP=$(echo $PORTKEY_SG_RESPONSE | jq -r '.GroupId')
@@ -74,7 +74,7 @@ EFS_SG_RESPONSE=$(aws ec2 create-security-group \
     --group-name portkey-efs-sg \
     --description "Security group for Portkey EFS" \
     --vpc-id ${VPC_ID} \
-    --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-efs-sg}, {Key=Environment,Value=${ENVIRONMENT}}]' \
+    --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-efs-sg}, {Key=Environment,Value=portkey-poc-innovation-lab}]' \
     --region ${AWS_REGION})
 
 EFS_SECURITY_GROUP=$(echo $EFS_SG_RESPONSE | jq -r '.GroupId')
