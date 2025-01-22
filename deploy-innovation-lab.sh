@@ -15,6 +15,7 @@ AWS_REGION=us-east-1
 AWS_ACCOUNT_ID=196856463470
 VPC_ID=vpc-02d65f45df09dcd82
 SUBNET_IDS="subnet-073e48862888f6be5 subnet-0c25b09f7caf0a7e8"
+SUBNET_IDS_COMMA_SEPARATED="subnet-073e48862888f6be5,subnet-0c25b09f7caf0a7e8"
 
 #ECS Cluster
 CLUSTER_NAME=portkey-ai
@@ -118,7 +119,7 @@ EFS_RESPONSE=$(aws efs create-file-system \
 EFS_ID=$(echo $EFS_RESPONSE | jq -r '.FileSystemId')
 
 # Create mount targets in each subnet
-for SUBNET in ${SUBNET_IDS//,/ }; do
+for SUBNET in ${SUBNET_IDS_COMMA_SEPARATED//,/ }; do
     aws efs create-mount-target \
         --file-system-id $EFS_ID \
         --subnet-id $SUBNET \
