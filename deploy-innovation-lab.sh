@@ -14,7 +14,7 @@ DOCKER_PASSWORD=throwaway@123
 AWS_REGION=us-east-1
 AWS_ACCOUNT_ID=196856463470
 VPC_ID=vpc-02d65f45df09dcd82
-SUBNET_IDS="subnet-073e48862888f6be5subnet-0c25b09f7caf0a7e8"
+SUBNET_IDS="subnet-073e48862888f6be5 subnet-0c25b09f7caf0a7e8"
 
 #ECS Cluster
 CLUSTER_NAME=portkey-ai
@@ -435,6 +435,12 @@ for LOG_GROUP in "${LOG_GROUPS[@]}"; do
         --retention-in-days 14 \
         --region ${AWS_REGION}
 done
+
+rm -rf frontend-task-definition.json
+rm -rf gateway-task-definition.json
+
+echo $FRONTEND_TASK_DEFINITION >> frontend-task-definition.json
+echo $GATEWAY_TASK_DEFINITION >> gateway-task-definition.json
 
 echo "Registering task definition for frontend..."
 aws ecs register-task-definition --cli-input-json file://frontend-task-definition.json
