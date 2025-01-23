@@ -1,0 +1,1558 @@
+#!/bin/bash
+
+# Read configuration from portkey.env
+if [ -f "portkey.env" ]; then
+    source portkey.env
+else
+    echo "Error: portkey.env file not found"
+    exit 1
+fi
+
+ENVIRONMENT=$(grep ENVIRONMENT portkey.env | cut -d '=' -f2)
+DOCKER_USERNAME=$(grep DOCKER_USERNAME portkey.env | cut -d '=' -f2)
+DOCKER_PASSWORD=$(grep DOCKER_PASSWORD portkey.env | cut -d '=' -f2)
+AWS_ACCESS_KEY_ID=$(grep AWS_ACCESS_KEY_ID portkey.env | cut -d '=' -f2)
+AWS_SECRET_ACCESS_KEY=$(grep AWS_SECRET_ACCESS_KEY portkey.env | cut -d '=' -f2)
+AWS_REGION=$(grep AWS_REGION portkey.env | cut -d '=' -f2)
+PORTKEY_CLIENT_AUTH=$(grep PORTKEY_CLIENT_AUTH portkey.env | cut -d '=' -f2)
+SUBNET_IDS=$(grep SUBNET_IDS portkey.env | cut -d '=' -f2)
+
+# init aws cli using credentials in portkey.env
+aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+aws configure set region ${AWS_REGION}
+
+CLUSTER_NAME=portkey-ai
+TASK_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
+EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
+
+echo "Setting up Docker Hub credentials in Secrets Manager..."
+DOCKER_CREDS_JSON=$(cat <<EOF
+{
+    "username": "${DOCKER_USERNAME}",
+    "password": "${DOCKER_PASSWORD}"
+}
+EOF
+)
+
+# Try to get existing secret
+EXISTING_SECRET=$(aws secretsmanager describe-secret \
+    --secret-id "portkey/docker-credentials" \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Docker credentials secret..."
+    DOCKER_CREDENTIALS_SECRET_ARN=$(echo $EXISTING_SECRET | jq -r '.ARN')
+else
+    echo "Creating new Docker credentials secret..."
+    DOCKER_CREDENTIALS_RESPONSE=$(aws secretsmanager create-secret \
+        --name "portkey/docker-credentials" \
+        --description "Docker Hub credentials for Portkey images" \
+        --secret-string "${DOCKER_CREDS_JSON}" \
+        --tags Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+    
+    DOCKER_CREDENTIALS_SECRET_ARN=$(echo $DOCKER_CREDENTIALS_RESPONSE | jq -r '.ARN')
+fi
+
+
+# Create or update the ECS task execution role policy
+echo "Updating ECS task execution role policy..."
+TASK_EXECUTION_POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue"
+            ],
+            "Resource": [
+                "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+)
+
+# Create or update the policy
+aws iam put-role-policy \
+    --role-name ecsTaskExecutionRole \
+    --policy-name PortkeySecretsPolicy \
+    --policy-document "${TASK_EXECUTION_POLICY}"
+
+# Create private S3 bucket with encryption
+echo "Creating private S3 bucket..."
+BUCKET_NAME="portkey-private-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+
+aws s3api create-bucket \
+    --bucket ${BUCKET_NAME} \
+    --region ${AWS_REGION}
+
+echo "S3 bucket ${BUCKET_NAME} created successfully"
+
+echo "Creating ECS cluster..."
+aws ecs create-cluster \
+    --cluster-name ${CLUSTER_NAME} \
+    --capacity-providers FARGATE \
+    --default-capacity-provider-strategy \
+        capacityProvider=FARGATE,weight=1,base=1 \
+    --tags key=Service,value=Portkey \
+    --region ${AWS_REGION}
+
+# Create security groups
+echo "Creating security groups..."
+
+echo "Setting up Portkey security group..."
+EXISTING_SG=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=portkey-sg" "Name=vpc-id,Values=${VPC_ID}" \
+    --query 'SecurityGroups[0].GroupId' \
+    --output text \
+    --region ${AWS_REGION})
+
+if [ "$EXISTING_SG" != "None" ] && [ -n "$EXISTING_SG" ]; then
+    echo "Using existing Portkey security group: ${EXISTING_SG}"
+    PORTKEY_SECURITY_GROUP=$EXISTING_SG
+else
+    echo "Creating new Portkey security group..."
+    PORTKEY_SG_RESPONSE=$(aws ec2 create-security-group \
+        --group-name portkey-sg \
+        --description "Security group for Portkey" \
+        --vpc-id ${VPC_ID} \
+        --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-sg}]' \
+        --region ${AWS_REGION})
+
+    PORTKEY_SECURITY_GROUP=$(echo $PORTKEY_SG_RESPONSE | jq -r '.GroupId')
+fi
+
+aws ec2 authorize-security-group-ingress \
+    --group-id ${PORTKEY_SECURITY_GROUP} \
+    --protocol tcp \
+    --port 80 \
+    --cidr 0.0.0.0/0 \
+    --region ${AWS_REGION}
+
+# EFS Security Group
+EFS_SG_NAME="portkey-efs-sg"
+EFS_SECURITY_GROUP=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=${EFS_SG_NAME}" \
+    --query 'SecurityGroups[0].GroupId' \
+    --output text \
+    --region ${AWS_REGION})
+
+if [ "$EFS_SECURITY_GROUP" = "None" ] || [ -z "$EFS_SECURITY_GROUP" ]; then
+    echo "Creating new EFS security group..."
+    EFS_SG_RESPONSE=$(aws ec2 create-security-group \
+        --group-name ${EFS_SG_NAME} \
+        --description "Security group for Portkey EFS" \
+        --vpc-id ${VPC_ID} \
+        --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=portkey-efs-sg}]' \
+        --region ${AWS_REGION})
+    
+    EFS_SECURITY_GROUP=$(echo $EFS_SG_RESPONSE | jq -r '.GroupId')
+else
+    echo "Using existing EFS security group: ${EFS_SECURITY_GROUP}"
+fi
+
+# Allow gateway to access EFS
+aws ec2 authorize-security-group-ingress \
+    --group-id ${EFS_SECURITY_GROUP} \
+    --protocol tcp \
+    --port 2049 \
+    --source-group ${PORTKEY_SECURITY_GROUP} \
+    --region ${AWS_REGION}
+
+# Allow all outbound traffic for all security groups
+for SG in ${PORTKEY_SECURITY_GROUP} ${EFS_SECURITY_GROUP}; do
+    aws ec2 authorize-security-group-egress \
+        --group-id ${SG} \
+        --protocol -1 \
+        --port -1 \
+        --cidr 0.0.0.0/0 \
+        --region ${AWS_REGION}
+done
+
+# Create EFS file system
+echo "Creating EFS file system for databases..."
+EFS_RESPONSE=$(aws efs create-file-system \
+    --performance-mode generalPurpose \
+    --throughput-mode bursting \
+    --encrypted \
+    --tags Key=Name,Value=portkey-storage Key=Environment,Value=${ENVIRONMENT} \
+    --region ${AWS_REGION})
+
+EFS_ID=$(echo $EFS_RESPONSE | jq -r '.FileSystemId')
+
+echo "Waiting for EFS file system to be available..."
+while true; do
+    STATUS=$(aws efs describe-file-systems \
+        --file-system-id $EFS_ID \
+        --region ${AWS_REGION} \
+        | jq -r '.FileSystems[0].LifeCycleState')
+    
+    if [ "$STATUS" = "available" ]; then
+        echo "EFS file system is now available"
+        break
+    fi
+    
+    echo "EFS status: $STATUS. Waiting..."
+    sleep 10
+done
+
+# Create mount targets in each subnet
+for SUBNET in ${SUBNET_IDS//,/ }; do
+    aws efs create-mount-target \
+        --file-system-id $EFS_ID \
+        --subnet-id $SUBNET \
+        --security-groups ${EFS_SECURITY_GROUP} \
+        --region ${AWS_REGION}
+done
+
+# Create EFS access points
+MYSQL_AP=$(aws efs create-access-point \
+    --file-system-id $EFS_ID \
+    --posix-user Uid=999,Gid=999 \
+    --root-directory Path=/mysql,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+    --tags Key=Name,Value=portkey-mysql Key=Environment,Value=${ENVIRONMENT} \
+    --region ${AWS_REGION} | jq -r '.AccessPointId')
+
+REDIS_AP=$(aws efs create-access-point \
+    --file-system-id $EFS_ID \
+    --posix-user Uid=999,Gid=999 \
+    --root-directory Path=/redis,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+    --tags Key=Name,Value=portkey-redis Key=Environment,Value=${ENVIRONMENT} \
+    --region ${AWS_REGION} | jq -r '.AccessPointId')
+
+# Create a properly formatted subnet list for AWS CLI JSON
+SUBNET_LIST_JSON=$(echo ${SUBNET_IDS} | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
+
+echo "Creating ALBs..."
+
+# Check/Create Frontend ALB
+EXISTING_FRONTEND_ALB=$(aws elbv2 describe-load-balancers \
+    --names portkey-frontend-alb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Frontend ALB..."
+    FRONTEND_ALB_ARN=$(echo $EXISTING_FRONTEND_ALB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    FRONTEND_ALB_DNS=$(echo $EXISTING_FRONTEND_ALB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new Frontend ALB..."
+    FRONTEND_ALB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-frontend-alb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --security-groups ${PORTKEY_SECURITY_GROUP} \
+        --scheme internet-facing \
+        --type application \
+        --tags Key=Name,Value=portkey-frontend-alb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    FRONTEND_ALB_ARN=$(echo $FRONTEND_ALB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    FRONTEND_ALB_DNS=$(echo $FRONTEND_ALB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+# Check/Create Backend ALB
+EXISTING_BACKEND_ALB=$(aws elbv2 describe-load-balancers \
+    --names portkey-backend-alb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Backend ALB..."
+    BACKEND_ALB_ARN=$(echo $EXISTING_BACKEND_ALB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    BACKEND_ALB_DNS=$(echo $EXISTING_BACKEND_ALB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new Backend ALB..."
+    BACKEND_ALB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-backend-alb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --security-groups ${PORTKEY_SECURITY_GROUP} \
+        --scheme internal \
+        --type application \
+        --tags Key=Name,Value=portkey-backend-alb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    BACKEND_ALB_ARN=$(echo $BACKEND_ALB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    BACKEND_ALB_DNS=$(echo $BACKEND_ALB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+# Check/Create Gateway ALB
+EXISTING_GATEWAY_ALB=$(aws elbv2 describe-load-balancers \
+    --names portkey-gateway-alb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Gateway ALB..."
+    GATEWAY_ALB_ARN=$(echo $EXISTING_GATEWAY_ALB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    GATEWAY_ALB_DNS=$(echo $EXISTING_GATEWAY_ALB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new Gateway ALB..."
+    GATEWAY_ALB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-gateway-alb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --security-groups ${PORTKEY_SECURITY_GROUP} \
+        --scheme internet-facing \
+        --type application \
+        --tags Key=Name,Value=portkey-gateway-alb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    GATEWAY_ALB_ARN=$(echo $GATEWAY_ALB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    GATEWAY_ALB_DNS=$(echo $GATEWAY_ALB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+# Check/Create Redis NLB
+EXISTING_REDIS_NLB=$(aws elbv2 describe-load-balancers \
+    --names portkey-redis-nlb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Redis NLB..."
+    REDIS_NLB_ARN=$(echo $EXISTING_REDIS_NLB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    REDIS_NLB_DNS=$(echo $EXISTING_REDIS_NLB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new Redis NLB..."
+    REDIS_NLB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-redis-nlb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --scheme internal \
+        --type network \
+        --tags Key=Name,Value=portkey-redis-nlb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    REDIS_NLB_ARN=$(echo $REDIS_NLB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    REDIS_NLB_DNS=$(echo $REDIS_NLB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+CLICKHOUSE_CONFIG=$(cat <<EOF
+<clickhouse>
+    <path>/var/lib/clickhouse/</path>
+    <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+    <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+    <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+    <access_control_path>/var/lib/clickhouse/access/</access_control_path>
+</clickhouse>
+EOF
+)
+
+CLICKHOUSE_USERS=$(cat <<EOF
+<clickhouse>
+    <users>
+        <default>
+            <access_management>1</access_management>
+            <named_collection_control>1</named_collection_control>
+            <show_named_collections>1</show_named_collections>
+            <show_named_collections_secrets>1</show_named_collections_secrets>
+            <profile>default</profile>
+        </default>
+    </users>
+    <profiles>
+        <default>
+            <async_insert>1</async_insert>
+            <async_insert_max_data_size>2000000</async_insert_max_data_size>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <parallel_view_processing>1</parallel_view_processing>
+            <materialize_ttl_after_modify>0</materialize_ttl_after_modify>
+            <wait_for_async_insert_timeout>25</wait_for_async_insert_timeout>
+        </default>
+    </profiles>
+</clickhouse>
+EOF
+)
+
+CLICKHOUSE_AP=$(aws efs create-access-point \
+    --file-system-id $EFS_ID \
+    --posix-user Uid=999,Gid=999 \
+    --root-directory Path=/clickhouse,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+    --tags Key=Name,Value=portkey-clickhouse Key=Environment,Value=${ENVIRONMENT} \
+    --region ${AWS_REGION} | jq -r '.AccessPointId')
+
+NGINX_CONF=$(cat <<EOF
+server {
+    listen 80;
+    server_name localhost;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    
+    location /config.js {
+        alias /usr/share/nginx/html/config.js;
+    }
+
+    location /albus/ {
+        rewrite ^/albus(.*)$ $1 break;
+        proxy_pass http://${BACKEND_ALB_DNS};
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_method $request_method;
+        proxy_pass_request_body on;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_body $request_body;
+        proxy_buffering off;
+    }
+
+    location /api/ {
+        rewrite ^/api(.*)$ $1 break;
+        proxy_pass http://${GATEWAY_ALB_DNS};
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_method $request_method;
+        proxy_pass_request_body on;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_body $request_body;
+        proxy_buffering off;
+    }
+
+    error_page 404 /index.html;
+
+    # Additional security headers
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Content-Type-Options "nosniff";
+}
+EOF
+)
+
+CONFIG_JS=$(cat <<EOF
+window.APP_CONFIG = { 
+    VITE_API_URL: "http://${GATEWAY_ALB_DNS}", 
+    VITE_BASE_URL: "/albus", 
+    VITE_PRIVATE_DEPLOYMENT: "ON", 
+    VITE_AUTH_MODE: "NO_AUTH" 
+};
+EOF
+)
+
+# Convert Clickhouse configs to base64
+CLICKHOUSE_CONFIG_B64=$(echo "${CLICKHOUSE_CONFIG}" | base64 -w 0)
+CLICKHOUSE_USERS_B64=$(echo "${CLICKHOUSE_USERS}" | base64 -w 0)
+
+# Write configurations to temporary files
+TEMP_DIR=$(mktemp -d)
+cat > "${TEMP_DIR}/nginx.conf" << 'NGINX_EOF'
+server {
+    listen 80;
+    server_name localhost;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    
+    location /config.js {
+        alias /usr/share/nginx/html/config.js;
+    }
+
+    location /albus/ {
+        rewrite ^/albus(.*)$ $1 break;
+        proxy_pass http://${BACKEND_ALB_DNS};
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_method $request_method;
+        proxy_pass_request_body on;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_body $request_body;
+        proxy_buffering off;
+    }
+
+    location /api/ {
+        rewrite ^/api(.*)$ $1 break;
+        proxy_pass http://${GATEWAY_ALB_DNS};
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_method $request_method;
+        proxy_pass_request_body on;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_body $request_body;
+        proxy_buffering off;
+    }
+
+    error_page 404 /index.html;
+
+    # Additional security headers
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Content-Type-Options "nosniff";
+}
+NGINX_EOF
+
+cat > "${TEMP_DIR}/config.js" << CONFIG_EOF
+window.APP_CONFIG = { 
+    VITE_API_URL: "http://${GATEWAY_ALB_DNS}", 
+    VITE_BASE_URL: "/albus", 
+    VITE_PRIVATE_DEPLOYMENT: "ON", 
+    VITE_AUTH_MODE: "NO_AUTH" 
+};
+CONFIG_EOF
+
+# Update the frontend task definition to use base64 encoded configs
+NGINX_CONF_B64=$(base64 -w 0 "${TEMP_DIR}/nginx.conf")
+CONFIG_JS_B64=$(base64 -w 0 "${TEMP_DIR}/config.js")
+
+FRONTEND_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-frontend",
+    "containerDefinitions": [
+        {
+            "name": "config-init",
+            "image": "amazon/aws-cli:latest",
+            "essential": false,
+            "command": [
+                "sh",
+                "-c",
+                "echo '${NGINX_CONF_B64}' | base64 -d > /config/nginx.conf && echo '${CONFIG_JS_B64}' | base64 -d > /config/config.js"
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/config",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-frontend",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "config-init"
+                }
+            }
+        },
+        {
+            "name": "frontend",
+            "image": "docker.io/portkeyai/frontend:latest",
+            "repositoryCredentials": {
+                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            },
+            "dependsOn": [
+                {
+                    "containerName": "config-init",
+                    "condition": "SUCCESS"
+                }
+            ],
+            "command": [
+                "/bin/sh",
+                "-c",
+                "echo \"Starting copy operations...\"; ls -l /config; cp /config/nginx.conf /etc/nginx/conf.d/default.conf && echo \"nginx.conf copied\" || echo \"Failed to copy nginx.conf\"; cp /config/config.js /usr/share/nginx/html/config.js && echo \"config.js copied\" || echo \"Failed to copy config.js\"; echo \"Copy operations completed\"; echo \"Starting Nginx...\"; exec nginx -g 'daemon off;'"
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/config",
+                    "readOnly": true
+                }
+            ],
+            "portMappings": [
+                {
+                    "containerPort": 80,
+                    "hostPort": 80,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "ENV",
+                    "value": "${ENVIRONMENT}"
+                },
+                {
+                    "name": "VITE_API_URL",
+                    "value": "http://${GATEWAY_ALB_DNS}"
+                },
+                {
+                    "name": "VITE_BASE_URL",
+                    "value": "/albus"
+                },
+                {
+                    "name": "VITE_PRIVATE_DEPLOYMENT",
+                    "value": "ON"
+                },
+                {
+                    "name": "VITE_AUTH_MODE",
+                    "value": "NO_AUTH"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-frontend",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "volumes": [
+        {
+            "name": "config"
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+echo "Frontend Task Definition: ${FRONTEND_TASK_DEFINITION}"
+
+BACKEND_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-backend",
+    "containerDefinitions": [
+        {
+            "name": "backend",
+            "image": "docker.io/portkeyai/backend:latest",
+            "repositoryCredentials": {
+                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            },
+            "environment": [
+                {
+                    "name": "PORT",
+                    "value": "8080"
+                },
+                {
+                    "name": "AUTH_MODE",
+                    "value": "NO_AUTH"
+                },
+                {
+                    "name": "JWT_PRIVATE_KEY",
+                    "value": "randomstring"
+                },
+                {
+                    "name": "PRIVATE_DEPLOYMENT",
+                    "value": "ON"
+                },
+                {
+                    "name": "SERVICE_NAME",
+                    "value": "portkey-backend"
+                },
+                {
+                    "name": "GATEWAY_BASE_URL",
+                    "value": "http://${GATEWAY_ALB_DNS}"
+                },
+                {
+                    "name": "GATEWAY_CACHE_MODE",
+                    "value": "SELF"
+                },
+                {
+                    "name": "CONTROL_PLANE_URL",
+                    "value": "http://${FRONTEND_ALB_DNS}"
+                },
+                {
+                    "name": "CONTROL_PANEL_URL",
+                    "value": "http://${FRONTEND_ALB_DNS}"
+                },
+                {
+                    "name": "ALBUS_BASE_URL",
+                    "value": "http://${GATEWAY_ALB_DNS}/albus"
+                },
+                {
+                    "name": "ENV",
+                    "value": "${ENVIRONMENT}"
+                },
+                {
+                    "name": "POLYJUICE_FINETUNE_ENDPOINT",
+                    "value": "http://localhost:8081"
+                },
+                {
+                    "name": "LOG_STORE",
+                    "value": "s3"
+                },
+                {
+                    "name": "LOG_STORE_ACCESS_KEY",
+                    "value": "${AWS_ACCESS_KEY_ID}"
+                },
+                {
+                    "name": "LOG_STORE_SECRET_KEY",
+                    "value": "${AWS_SECRET_ACCESS_KEY}"
+                },
+                {
+                    "name": "LOG_STORE_REGION",
+                    "value": "${AWS_REGION}"
+                },
+                {
+                    "name": "LOG_STORE_GENERATIONS_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "LOG_STORE_BASEPATH",
+                    "value": "generations"
+                },
+                {
+                    "name": "FINETUNES_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "LOG_EXPORTS_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "CACHE_STORE",
+                    "value": "redis_store"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://${REDIS_NLB_DNS}:6379"
+                },
+                {
+                    "name": "REDIS_TLS_ENABLED",
+                    "value": "false"
+                },
+                {
+                    "name": "REDIS_MODE",
+                    "value": "single"
+                },
+                {
+                    "name": "DB_HOST",
+                    "value": "localhost"
+                },
+                {
+                    "name": "DB_PORT",
+                    "value": "3306"
+                },
+                {
+                    "name": "DB_USER",
+                    "value": "root"
+                },
+                {
+                    "name": "DB_PASS",
+                    "value": "123456789"
+                },
+                {
+                    "name": "DB_NAME",
+                    "value": "portkey_local"
+                },
+                {
+                    "name": "CLICKHOUSE_DATABASE",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_HOST",
+                    "value": "http://localhost"
+                },
+                {
+                    "name": "CLICKHOUSE_PORT",
+                    "value": "8123"
+                },
+                {
+                    "name": "CLICKHOUSE_NATIVE_PORT",
+                    "value": "9000"
+                },
+                {
+                    "name": "CLICKHOUSE_USER",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_PASSWORD",
+                    "value": "123456789"
+                },
+                {
+                    "name": "CLICKHOUSE_DB",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_TLS",
+                    "value": "false"
+                }
+            ],
+            "portMappings": [
+                {
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "command": [
+                "/bin/sh", 
+                "-c", 
+                "/app/docker-entrypoint.sh && npx knex migrate:latest --env local && npx knex seed:run --env local && node ch_init.js && pm2-runtime src/server.js"
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-backend",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        },
+        {
+            "name": "mysql",
+            "image": "docker.io/mysql:8.1",
+            "portMappings": [
+                {
+                    "containerPort": 3306,
+                    "hostPort": 3306,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": false,
+            "environment": [
+                {
+                    "name": "MYSQL_ROOT_PASSWORD",
+                    "value": "$123456789"
+                },
+                {
+                    "name": "MYSQL_PASSWORD",
+                    "value": "$123456789"
+                },
+                {
+                    "name": "MYSQL_DATABASE",
+                    "value": "portkey_local"
+                },
+                {
+                    "name": "MYSQL_USER",
+                    "value": "root"
+                }
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "mysql-data",
+                    "containerPath": "/var/lib/mysql",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-mysql",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        },
+        {
+            "name": "clickhouse-config-init",
+            "image": "amazon/aws-cli:latest",
+            "essential": false,
+            "command": [
+                "sh",
+                "-c",
+                "mkdir -p /config/clickhouse && echo '${CLICKHOUSE_CONFIG_B64}' | base64 -d > /config/clickhouse/config.xml && echo '${CLICKHOUSE_USERS_B64}' | base64 -d > /config/clickhouse/users.xml"
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/config",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-backend",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "clickhouse-config-init"
+                }
+            }
+        },
+        {
+            "name": "clickhouse",
+            "image": "docker.io/clickhouse/clickhouse-server:latest",
+            "dependsOn": [
+                {
+                    "containerName": "clickhouse-config-init",
+                    "condition": "SUCCESS"
+                }
+            ],
+            "portMappings": [
+                {
+                    "containerPort": 8123,
+                    "hostPort": 8123,
+                    "protocol": "tcp"
+                },
+                {
+                    "containerPort": 9000,
+                    "hostPort": 9000,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": false,
+            "environment": [
+                {
+                    "name": "CLICKHOUSE_DB",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_USER",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_PASSWORD",
+                    "value": "123456789"
+                }
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "clickhouse-data",
+                    "containerPath": "/var/lib/clickhouse",
+                    "readOnly": false
+                },
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/etc/clickhouse-server",
+                    "readOnly": true
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-clickhouse",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        },
+        {
+            "name": "dataservice",
+            "image": "docker.io/portkeyai/data-service:latest",
+            "repositoryCredentials": {
+                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            },
+            "environment": [
+                {
+                    "name": "PORT",
+                    "value": "8081"
+                },
+                {
+                    "name": "PRIVATE_DEPLOYMENT",
+                    "value": "ON"
+                },
+                {
+                    "name": "SERVICE_NAME",
+                    "value": "portkey-dataservice"
+                },
+                {
+                    "name": "ENV",
+                    "value": "${ENVIRONMENT}"
+                },
+                {
+                    "name": "LOG_STORE",
+                    "value": "s3"
+                },
+                {
+                    "name": "LOG_STORE_ACCESS_KEY",
+                    "value": "${AWS_ACCESS_KEY_ID}"
+                },
+                {
+                    "name": "LOG_STORE_SECRET_KEY",
+                    "value": "${AWS_SECRET_ACCESS_KEY}"
+                },
+                {
+                    "name": "LOG_STORE_REGION",
+                    "value": "${AWS_REGION}"
+                },
+                {
+                    "name": "LOG_STORE_GENERATIONS_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "LOG_STORE_BASEPATH",
+                    "value": "generations"
+                },
+                {
+                    "name": "FINETUNES_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "LOG_EXPORTS_BUCKET",
+                    "value": "${BUCKET_NAME}"
+                },
+                {
+                    "name": "CACHE_STORE",
+                    "value": "redis_store"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://${REDIS_NLB_DNS}:6379"
+                },
+                {
+                    "name": "REDIS_TLS_ENABLED",
+                    "value": "false"
+                },
+                {
+                    "name": "REDIS_MODE",
+                    "value": "single"
+                },
+                {
+                    "name": "ANALYTICS_STORE",
+                    "value": "clickhouse"
+                },
+                {
+                    "name": "CLICKHOUSE_HOST",
+                    "value": "http://localhost"
+                },
+                {
+                    "name": "CLICKHOUSE_PORT",
+                    "value": "8123"
+                },
+                {
+                    "name": "CLICKHOUSE_DB",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_NATIVE_PORT",
+                    "value": "9000"
+                },
+                {
+                    "name": "CLICKHOUSE_USER",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_PASSWORD",
+                    "value": "123456789"
+                },
+                {
+                    "name": "CLICKHOUSE_TLS",
+                    "value": "false"
+                }
+            ],
+            "portMappings": [
+                {
+                    "containerPort": 8081,
+                    "hostPort": 8081,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": false,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-backend",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "dataservice"
+                }
+            }
+        }
+    ],
+    "volumes": [
+        {
+            "name": "mysql-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${MYSQL_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        },
+        {
+            "name": "clickhouse-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${CLICKHOUSE_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        },
+        {
+            "name": "config"
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "1024",
+    "memory": "4096",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+echo "Backend Task Definition: ${BACKEND_TASK_DEFINITION}"
+
+GATEWAY_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-gateway",
+    "containerDefinitions": [
+        {
+            "name": "gateway",
+            "image": "docker.io/portkeyai/gateway_enterprise:latest",
+            "repositoryCredentials": {
+                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            },
+            "environment": [
+                {
+                    "name": "PORT",
+                    "value": "80"
+                },
+                {
+                    "name": "LOG_STORE",
+                    "value": "CONTROL_PLANE"
+                },
+                {
+                    "name": "ANALYTICS_STORE",
+                    "value": "control_plane"
+                },
+                {
+                    "name": "ALBUS_BASE_PATH",
+                    "value": "http://${BACKEND_ALB_DNS}/albus"
+                },
+                {
+                    "name": "PORTKEY_CLIENT_AUTH",
+                    "value": "client-auth-_2jan4_3n3b2:.<fKKfbe"
+                },
+                {
+                    "name": "PRIVATE_DEPLOYMENT",
+                    "value": "ON"
+                },
+                {
+                    "name": "SERVICE_NAME",
+                    "value": "portkey-gateway"
+                },
+                {
+                    "name": "GATEWAY_CACHE_MODE",
+                    "value": "SELF"
+                },
+                {
+                    "name": "ENV",
+                    "value": "${ENVIRONMENT}"
+                },
+                {
+                    "name": "ALBUS_BASEPATH",
+                    "value": "http://${BACKEND_ALB_DNS}/albus"
+                },
+                {
+                    "name": "CACHE_STORE",
+                    "value": "redis_store"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://${REDIS_NLB_DNS}:6379"
+                },
+                {
+                    "name": "REDIS_TLS_ENABLED",
+                    "value": "false"
+                },
+                {
+                    "name": "REDIS_MODE",
+                    "value": "single"
+                }
+            ],
+            "portMappings": [
+                {
+                    "containerPort": 80,
+                    "hostPort": 80,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-gateway",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+echo "Gateway Task Definition: ${GATEWAY_TASK_DEFINITION}"
+
+REDIS_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-redis",
+    "containerDefinitions": [
+        {
+            "name": "redis",
+            "image": "docker.io/redis:alpine",
+            "portMappings": [
+                {
+                    "containerPort": 6379,
+                    "hostPort": 6379,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "mountPoints": [
+                {
+                    "sourceVolume": "redis-data",
+                    "containerPath": "/data",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-redis",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "volumes": [
+        {
+            "name": "redis-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${REDIS_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+echo "Creating CloudWatch log groups..."
+LOG_GROUPS=(
+    "/ecs/portkey-frontend"
+    "/ecs/portkey-gateway"
+    "/ecs/portkey-backend"
+    "/ecs/portkey-redis"
+    "/ecs/portkey-clickhouse"
+)
+
+for LOG_GROUP in "${LOG_GROUPS[@]}"; do
+    aws logs create-log-group \
+        --log-group-name ${LOG_GROUP} \
+        --region ${AWS_REGION}
+    
+    # Optionally set retention policy (e.g., 14 days)
+    aws logs put-retention-policy \
+        --log-group-name ${LOG_GROUP} \
+        --retention-in-days 14 \
+        --region ${AWS_REGION}
+done
+
+# Register all task definitions
+echo "Registering task definitions..."
+FRONTEND_TASK_DEF_ARN=$(echo "${FRONTEND_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+BACKEND_TASK_DEF_ARN=$(echo "${BACKEND_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+# Register gateway task definition  
+GATEWAY_TASK_DEF_ARN=$(echo "${GATEWAY_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+# Register redis task definition
+REDIS_TASK_DEF_ARN=$(echo "${REDIS_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+echo "Task definitions registered successfully: "
+echo "Frontend: ${FRONTEND_TASK_DEF_ARN}"
+echo "Backend: ${BACKEND_TASK_DEF_ARN}"
+echo "Gateway: ${GATEWAY_TASK_DEF_ARN}"
+echo "Redis: ${REDIS_TASK_DEF_ARN}"
+
+echo "Setting up target groups..."
+
+# Check/Create Frontend Target Group
+EXISTING_FRONTEND_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-frontend-tg \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing frontend target group..."
+    FRONTEND_TG_ARN=$(echo $EXISTING_FRONTEND_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new frontend target group..."
+    FRONTEND_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-frontend-tg \
+        --protocol HTTP \
+        --port 80 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/health" \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 5 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    FRONTEND_TG_ARN=$(echo $FRONTEND_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+# Check/Create Backend Target Group
+EXISTING_BACKEND_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-backend-tg \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing backend target group..."
+    BACKEND_TG_ARN=$(echo $EXISTING_BACKEND_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new backend target group..."
+    BACKEND_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-backend-tg \
+        --protocol HTTP \
+        --port 80 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/health" \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 5 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    BACKEND_TG_ARN=$(echo $BACKEND_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+# Check/Create Gateway Target Group
+EXISTING_GATEWAY_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-gateway-tg \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing gateway target group..."
+    GATEWAY_TG_ARN=$(echo $EXISTING_GATEWAY_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new gateway target group..."
+    GATEWAY_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-gateway-tg \
+        --protocol HTTP \
+        --port 80 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/v1/health" \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 5 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    GATEWAY_TG_ARN=$(echo $GATEWAY_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+# Check/Create Redis Target Group
+EXISTING_REDIS_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-redis-tg \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing redis target group..."
+    REDIS_TG_ARN=$(echo $EXISTING_REDIS_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new redis target group..."
+    REDIS_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-redis-tg \
+        --protocol TCP \
+        --port 6379 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-protocol TCP \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 10 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    REDIS_TG_ARN=$(echo $REDIS_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+
+# Create listeners for each ALB
+echo "Creating ALB listeners..."
+
+# Frontend Listener
+aws elbv2 create-listener \
+    --load-balancer-arn ${FRONTEND_ALB_ARN} \
+    --protocol HTTP \
+    --port 80 \
+    --default-actions Type=forward,TargetGroupArn=${FRONTEND_TG_ARN} \
+    --region ${AWS_REGION}
+
+# Backend Listener
+aws elbv2 create-listener \
+    --load-balancer-arn ${BACKEND_ALB_ARN} \
+    --protocol HTTP \
+    --port 80 \
+    --default-actions Type=forward,TargetGroupArn=${BACKEND_TG_ARN} \
+    --region ${AWS_REGION}
+
+# Gateway Listener
+aws elbv2 create-listener \
+    --load-balancer-arn ${GATEWAY_ALB_ARN} \
+    --protocol HTTP \
+    --port 80 \
+    --default-actions Type=forward,TargetGroupArn=${GATEWAY_TG_ARN} \
+    --region ${AWS_REGION}
+
+# Redis Listener (TCP)
+aws elbv2 create-listener \
+    --load-balancer-arn ${REDIS_NLB_ARN} \
+    --protocol TCP \
+    --port 6379 \
+    --default-actions Type=forward,TargetGroupArn=${REDIS_TG_ARN} \
+    --region ${AWS_REGION}
+
+echo "Waiting for listeners to be active..."
+sleep 10
+
+# Create ECS services
+aws ecs create-service \
+    --cluster ${CLUSTER_NAME} \
+    --service-name portkey-frontend \
+    --task-definition ${FRONTEND_TASK_DEF_ARN} \
+    --desired-count 1 \
+    --launch-type FARGATE \
+    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+    --load-balancers "targetGroupArn=${FRONTEND_TG_ARN},containerName=frontend,containerPort=80"
+
+aws ecs create-service \
+    --cluster ${CLUSTER_NAME} \
+    --service-name portkey-backend \
+    --task-definition ${BACKEND_TASK_DEF_ARN} \
+    --desired-count 1 \
+    --launch-type FARGATE \
+    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+    --load-balancers "targetGroupArn=${BACKEND_TG_ARN},containerName=backend,containerPort=8080"
+
+aws ecs create-service \
+    --cluster ${CLUSTER_NAME} \
+    --service-name portkey-gateway \
+    --task-definition ${GATEWAY_TASK_DEF_ARN} \
+    --desired-count 1 \
+    --launch-type FARGATE \
+    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+    --load-balancers "targetGroupArn=${GATEWAY_TG_ARN},containerName=gateway,containerPort=80"
+
+aws ecs create-service \
+    --cluster ${CLUSTER_NAME} \
+    --service-name portkey-redis \
+    --task-definition ${REDIS_TASK_DEF_ARN} \
+    --desired-count 1 \
+    --launch-type FARGATE \
+    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+    --load-balancers "targetGroupArn=${REDIS_TG_ARN},containerName=redis,containerPort=6379"
+
+# Update resources JSON file to include data-service
+cat <<EOF > portkey-resources.json
+{
+    "cluster_name": "${CLUSTER_NAME}",
+    "security_groups": {
+        "portkey_sg": "${PORTKEY_SECURITY_GROUP}",
+        "efs_sg": "${EFS_SECURITY_GROUP}"
+    },
+    "efs": {
+        "filesystem_id": "${EFS_ID}",
+        "access_points": {
+            "mysql": "${MYSQL_AP}",
+            "redis": "${REDIS_AP}",
+            "clickhouse": "${CLICKHOUSE_AP}"
+        }
+    },
+    "target_groups": {
+        "frontend": "${FRONTEND_TG_ARN}",
+        "backend": "${BACKEND_TG_ARN}",
+        "gateway": "${GATEWAY_TG_ARN}",
+        "redis": "${REDIS_TG_ARN}"
+    },
+    "load_balancers": {
+        "frontend": "${FRONTEND_ALB_ARN}",
+        "backend": "${BACKEND_ALB_ARN}",
+        "gateway": "${GATEWAY_ALB_ARN}",
+        "redis": "${REDIS_NLB_ARN}"
+    },
+    "load_balancer_dns": {
+        "frontend": "${FRONTEND_ALB_DNS}",
+        "backend": "${BACKEND_ALB_DNS}",
+        "gateway": "${GATEWAY_ALB_DNS}",
+        "redis": "${REDIS_NLB_DNS}"
+    },
+    "log_groups": "${LOG_GROUPS[@]}",
+    "docker_credentials_secret": "${DOCKER_CREDENTIALS_SECRET_ARN}",
+    "region": "${AWS_REGION}",
+    "s3_bucket": {
+        "name": "${BUCKET_NAME}",
+        "arn": "arn:aws:s3:::${BUCKET_NAME}"
+    }
+}
+EOF
+
+echo "Resource information saved to portkey-resources.json"
+echo "Load Balancer DNS Names:"
+echo "Frontend: ${FRONTEND_ALB_DNS}"
+echo "Backend: ${BACKEND_ALB_DNS}"
+echo "Gateway: ${GATEWAY_ALB_DNS}"
+echo "Redis: ${REDIS_NLB_DNS}"
+
+# Clean up temp directory
+rm -rf "${TEMP_DIR}"
