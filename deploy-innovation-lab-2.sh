@@ -11,16 +11,16 @@ fi
 ENVIRONMENT=$(grep ENVIRONMENT portkey.env | cut -d '=' -f2)
 DOCKER_USERNAME=$(grep DOCKER_USERNAME portkey.env | cut -d '=' -f2)
 DOCKER_PASSWORD=$(grep DOCKER_PASSWORD portkey.env | cut -d '=' -f2)
-AWS_ACCESS_KEY_ID=$(grep AWS_ACCESS_KEY_ID portkey.env | cut -d '=' -f2)
-AWS_SECRET_ACCESS_KEY=$(grep AWS_SECRET_ACCESS_KEY portkey.env | cut -d '=' -f2)
+#AWS_ACCESS_KEY_ID=$(grep AWS_ACCESS_KEY_ID portkey.env | cut -d '=' -f2)
+#AWS_SECRET_ACCESS_KEY=$(grep AWS_SECRET_ACCESS_KEY portkey.env | cut -d '=' -f2)
 AWS_REGION=$(grep AWS_REGION portkey.env | cut -d '=' -f2)
 PORTKEY_CLIENT_AUTH=$(grep PORTKEY_CLIENT_AUTH portkey.env | cut -d '=' -f2)
 SUBNET_IDS=$(grep SUBNET_IDS portkey.env | cut -d '=' -f2)
 
 # init aws cli using credentials in portkey.env
-aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
-aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
-aws configure set region ${AWS_REGION}
+#aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+#aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+#aws configure set region ${AWS_REGION}
 
 CLUSTER_NAME=portkey-ai
 TASK_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
