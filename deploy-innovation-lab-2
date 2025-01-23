@@ -58,41 +58,41 @@ fi
 
 # Create or update the ECS task execution role policy
 echo "Updating ECS task execution role policy..."
-TASK_EXECUTION_POLICY=$(cat <<EOF
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "secretsmanager:GetSecretValue"
-            ],
-            "Resource": [
-                "${DOCKER_CREDENTIALS_SECRET_ARN}"
-            ]
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ecr:GetAuthorizationToken",
-                "ecr:BatchCheckLayerAvailability",
-                "ecr:GetDownloadUrlForLayer",
-                "ecr:BatchGetImage",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-EOF
-)
+#TASK_EXECUTION_POLICY=$(cat <<EOF
+#{
+#    "Version": "2012-10-17",
+#    "Statement": [
+#        {
+#            "Effect": "Allow",
+#            "Action": [
+#                "secretsmanager:GetSecretValue"
+#            ],
+#            "Resource": [
+#                "${DOCKER_CREDENTIALS_SECRET_ARN}"
+#            ]
+#        },
+#        {
+#            "Effect": "Allow",
+#            "Action": [
+#                "ecr:GetAuthorizationToken",
+#                "ecr:BatchCheckLayerAvailability",
+#                "ecr:GetDownloadUrlForLayer",
+#                "ecr:BatchGetImage",
+#                "logs:CreateLogStream",
+#                "logs:PutLogEvents"
+#            ],
+#            "Resource": "*"
+#        }
+#    ]
+#}
+#EOF
+#)
 
 # Create or update the policy
-aws iam put-role-policy \
-    --role-name ecsTaskExecutionRole \
-    --policy-name PortkeySecretsPolicy \
-    --policy-document "${TASK_EXECUTION_POLICY}"
+#aws iam put-role-policy \
+#    --role-name ecsTaskExecutionRole \
+#    --policy-name PortkeySecretsPolicy \
+#    --policy-document "${TASK_EXECUTION_POLICY}"
 
 # Create private S3 bucket with encryption
 echo "Creating private S3 bucket..."
