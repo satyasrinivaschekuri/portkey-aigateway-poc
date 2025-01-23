@@ -25,8 +25,8 @@ VPC_ID=$(grep VPC_ID portkey.env | cut -d '=' -f2)
 #aws configure set region ${AWS_REGION}
 
 CLUSTER_NAME=portkey-ai
-TASK_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
-EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole
+TASK_ROLE_ARN=arn:aws:iam::196856463470:role/SandboxServiceRole
+EXECUTION_ROLE_ARN=arn:aws:iam::196856463470:role/SandboxServiceRole
 
 echo "Setting up Docker Hub credentials in Secrets Manager..."
 DOCKER_CREDS_JSON=$(cat <<EOF
