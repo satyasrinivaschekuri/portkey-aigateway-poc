@@ -17,6 +17,7 @@ AWS_REGION=$(grep AWS_REGION portkey.env | cut -d '=' -f2)
 PORTKEY_CLIENT_AUTH=$(grep PORTKEY_CLIENT_AUTH portkey.env | cut -d '=' -f2)
 SUBNET_IDS=$(grep SUBNET_IDS portkey.env | cut -d '=' -f2)
 AWS_ACCOUNT_ID=$(grep AWS_ACCOUNT_ID portkey.env | cut -d '=' -f2)
+VPC_ID=$(grep VPC_ID portkey.env | cut -d '=' -f2)
 
 # init aws cli using credentials in portkey.env
 #aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
