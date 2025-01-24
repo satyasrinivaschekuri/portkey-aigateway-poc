@@ -143,7 +143,28 @@ fi
 aws ec2 authorize-security-group-ingress \
     --group-id ${PORTKEY_SECURITY_GROUP} \
     --protocol tcp \
-    --port 80 \
+    --port 3306 \
+    --cidr 0.0.0.0/0 \
+    --region ${AWS_REGION}
+
+aws ec2 authorize-security-group-ingress \
+    --group-id ${PORTKEY_SECURITY_GROUP} \
+    --protocol tcp \
+    --port 8080 \
+    --cidr 0.0.0.0/0 \
+    --region ${AWS_REGION}
+
+aws ec2 authorize-security-group-ingress \
+    --group-id ${PORTKEY_SECURITY_GROUP} \
+    --protocol tcp \
+    --port 8123 \
+    --cidr 0.0.0.0/0 \
+    --region ${AWS_REGION}
+
+aws ec2 authorize-security-group-ingress \
+    --group-id ${PORTKEY_SECURITY_GROUP} \
+    --protocol tcp \
+    --port 6379 \
     --cidr 0.0.0.0/0 \
     --region ${AWS_REGION}
 
@@ -187,32 +208,42 @@ for SG in ${PORTKEY_SECURITY_GROUP} ${EFS_SECURITY_GROUP}; do
         --region ${AWS_REGION}
 done
 
-# Create EFS file system
-echo "Creating EFS file system for databases..."
-EFS_RESPONSE=$(aws efs create-file-system \
-    --performance-mode generalPurpose \
-    --throughput-mode bursting \
-    --encrypted \
-    --tags Key=Name,Value=portkey-storage Key=Environment,Value=${ENVIRONMENT} \
-    --region ${AWS_REGION})
+# Check for existing EFS with portkey-storage tag
+echo "Checking for existing EFS file system..."
+EXISTING_EFS=$(aws efs describe-file-systems \
+    --region ${AWS_REGION} | \
+    jq -r '.FileSystems[] | select(.Tags[] | select(.Key=="Name" and .Value=="portkey-storage")) | .FileSystemId' | head -n1)
 
-EFS_ID=$(echo $EFS_RESPONSE | jq -r '.FileSystemId')
+if [ -n "$EXISTING_EFS" ]; then
+    echo "Using existing EFS file system: ${EXISTING_EFS}"
+    EFS_ID=$EXISTING_EFS
+else
+    echo "Creating new EFS file system for databases..."
+    EFS_RESPONSE=$(aws efs create-file-system \
+        --performance-mode generalPurpose \
+        --throughput-mode bursting \
+        --encrypted \
+        --tags Key=Name,Value=portkey-storage Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
 
-echo "Waiting for EFS file system to be available..."
-while true; do
-    STATUS=$(aws efs describe-file-systems \
-        --file-system-id $EFS_ID \
-        --region ${AWS_REGION} \
-        | jq -r '.FileSystems[0].LifeCycleState')
-    
-    if [ "$STATUS" = "available" ]; then
-        echo "EFS file system is now available"
-        break
-    fi
-    
-    echo "EFS status: $STATUS. Waiting..."
-    sleep 10
-done
+    EFS_ID=$(echo $EFS_RESPONSE | jq -r '.FileSystemId')
+
+    echo "Waiting for EFS file system to be available..."
+    while true; do
+        STATUS=$(aws efs describe-file-systems \
+            --file-system-id $EFS_ID \
+            --region ${AWS_REGION} \
+            | jq -r '.FileSystems[0].LifeCycleState')
+        
+        if [ "$STATUS" = "available" ]; then
+            echo "EFS file system is now available"
+            break
+        fi
+        
+        echo "EFS status: $STATUS. Waiting..."
+        sleep 10
+    done
+fi
 
 # Create mount targets in each subnet
 for SUBNET in ${SUBNET_IDS//,/ }; do
@@ -223,20 +254,59 @@ for SUBNET in ${SUBNET_IDS//,/ }; do
         --region ${AWS_REGION}
 done
 
-# Create EFS access points
-MYSQL_AP=$(aws efs create-access-point \
-    --file-system-id $EFS_ID \
-    --posix-user Uid=999,Gid=999 \
-    --root-directory Path=/mysql,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
-    --tags Key=Name,Value=portkey-mysql Key=Environment,Value=${ENVIRONMENT} \
-    --region ${AWS_REGION} | jq -r '.AccessPointId')
+# Check/Create MySQL Access Point
+echo "Setting up MySQL access point..."
+MYSQL_AP=$(aws efs describe-access-points \
+    --region ${AWS_REGION} | \
+    jq -r --arg fsid "$EFS_ID" '.AccessPoints[] | select(.FileSystemId==$fsid and (.Tags[] | select(.Key=="Name" and .Value=="portkey-mysql"))) | .AccessPointId' | head -n1)
 
-REDIS_AP=$(aws efs create-access-point \
-    --file-system-id $EFS_ID \
-    --posix-user Uid=999,Gid=999 \
-    --root-directory Path=/redis,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
-    --tags Key=Name,Value=portkey-redis Key=Environment,Value=${ENVIRONMENT} \
-    --region ${AWS_REGION} | jq -r '.AccessPointId')
+if [ -z "$MYSQL_AP" ]; then
+    echo "Creating new MySQL access point..."
+    MYSQL_AP=$(aws efs create-access-point \
+        --file-system-id $EFS_ID \
+        --posix-user Uid=999,Gid=999 \
+        --root-directory Path=/mysql,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+        --tags Key=Name,Value=portkey-mysql Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION} | jq -r '.AccessPointId')
+else
+    echo "Using existing MySQL access point: ${MYSQL_AP}"
+fi
+
+# Check/Create Redis Access Point
+echo "Setting up Redis access point..."
+REDIS_AP=$(aws efs describe-access-points \
+    --region ${AWS_REGION} | \
+    jq -r --arg fsid "$EFS_ID" '.AccessPoints[] | select(.FileSystemId==$fsid and (.Tags[] | select(.Key=="Name" and .Value=="portkey-redis"))) | .AccessPointId' | head -n1)
+
+if [ -z "$REDIS_AP" ]; then
+    echo "Creating new Redis access point..."
+    REDIS_AP=$(aws efs create-access-point \
+        --file-system-id $EFS_ID \
+        --posix-user Uid=999,Gid=999 \
+        --root-directory Path=/redis,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+        --tags Key=Name,Value=portkey-redis Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION} | jq -r '.AccessPointId')
+else
+    echo "Using existing Redis access point: ${REDIS_AP}"
+fi
+
+# Check/Create Clickhouse Access Point
+echo "Setting up Clickhouse access point..."
+CLICKHOUSE_AP=$(aws efs describe-access-points \
+    --region ${AWS_REGION} | \
+    jq -r --arg fsid "$EFS_ID" '.AccessPoints[] | select(.FileSystemId==$fsid and (.Tags[] | select(.Key=="Name" and .Value=="portkey-clickhouse"))) | .AccessPointId' | head -n1)
+
+if [ -z "$CLICKHOUSE_AP" ]; then
+    echo "Creating new Clickhouse access point..."
+    CLICKHOUSE_AP=$(aws efs create-access-point \
+        --file-system-id $EFS_ID \
+        --posix-user Uid=999,Gid=999 \
+        --root-directory Path=/clickhouse,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
+        --tags Key=Name,Value=portkey-clickhouse Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION} | jq -r '.AccessPointId')
+else
+    echo "Using existing Clickhouse access point: ${CLICKHOUSE_AP}"
+fi
 
 # Create a properly formatted subnet list for AWS CLI JSON
 SUBNET_LIST_JSON=$(echo ${SUBNET_IDS} | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
@@ -338,101 +408,221 @@ else
     REDIS_NLB_DNS=$(echo $REDIS_NLB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
 fi
 
+# Create Data Service ALB
+EXISTING_DATASERVICE_ALB=$(aws elbv2 describe-load-balancers \
+    --names portkey-dataservice-alb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing data service ALB..."
+    DATASERVICE_ALB_ARN=$(echo $EXISTING_DATASERVICE_ALB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    DATASERVICE_ALB_DNS=$(echo $EXISTING_DATASERVICE_ALB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new data service ALB..."
+    DATASERVICE_ALB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-dataservice-alb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --security-groups ${PORTKEY_SECURITY_GROUP} \
+        --scheme internal \
+        --type application \
+        --tags Key=Name,Value=portkey-dataservice-alb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    DATASERVICE_ALB_ARN=$(echo $DATASERVICE_ALB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    DATASERVICE_ALB_DNS=$(echo $DATASERVICE_ALB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+
+# Create MySQL NLB
+EXISTING_MYSQL_NLB=$(aws elbv2 describe-load-balancers \
+    --names portkey-mysql-nlb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing MySQL NLB..."
+    MYSQL_NLB_ARN=$(echo $EXISTING_MYSQL_NLB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    MYSQL_NLB_DNS=$(echo $EXISTING_MYSQL_NLB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new MySQL NLB..."
+    MYSQL_NLB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-mysql-nlb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --scheme internal \
+        --type network \
+        --tags Key=Name,Value=portkey-mysql-nlb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    MYSQL_NLB_ARN=$(echo $MYSQL_NLB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    MYSQL_NLB_DNS=$(echo $MYSQL_NLB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
+# Create Clickhouse ALB
+EXISTING_CLICKHOUSE_ALB=$(aws elbv2 describe-load-balancers \
+    --names portkey-clickhouse-alb \
+    --region ${AWS_REGION} 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Clickhouse ALB..."
+    CLICKHOUSE_ALB_ARN=$(echo $EXISTING_CLICKHOUSE_ALB | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    CLICKHOUSE_ALB_DNS=$(echo $EXISTING_CLICKHOUSE_ALB | jq -r '.LoadBalancers[0].DNSName')
+else
+    echo "Creating new Clickhouse ALB..."
+    CLICKHOUSE_ALB_RESPONSE=$(aws elbv2 create-load-balancer \
+        --name portkey-clickhouse-alb \
+        --subnets ${SUBNET_LIST_JSON} \
+        --security-groups ${PORTKEY_SECURITY_GROUP} \
+        --scheme internal \
+        --type application \
+        --tags Key=Name,Value=portkey-clickhouse-alb Key=Environment,Value=${ENVIRONMENT} \
+        --region ${AWS_REGION})
+
+    CLICKHOUSE_ALB_ARN=$(echo $CLICKHOUSE_ALB_RESPONSE | jq -r '.LoadBalancers[0].LoadBalancerArn')
+    CLICKHOUSE_ALB_DNS=$(echo $CLICKHOUSE_ALB_RESPONSE | jq -r '.LoadBalancers[0].DNSName')
+fi
+
 CLICKHOUSE_CONFIG=$(cat <<EOF
+<?xml version="1.0"?>
 <clickhouse>
+    <logger>
+        <level>information</level>
+        <console>1</console>
+    </logger>
+
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+    <listen_host>0.0.0.0</listen_host>
+
+    <max_connections>4096</max_connections>
+
+    <!-- For 'Connection: keep-alive' in HTTP 1.1 -->
+    <keep_alive_timeout>3</keep_alive_timeout>
+
+    <!-- Maximum number of concurrent queries. -->
+    <max_concurrent_queries>100</max_concurrent_queries>
+
+    <max_server_memory_usage>0</max_server_memory_usage>
+
+    <max_thread_pool_size>10000</max_thread_pool_size>
+
+    <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+
+    <total_memory_profiler_step>4194304</total_memory_profiler_step>
+
+    <total_memory_tracker_sample_probability>0</total_memory_tracker_sample_probability>
+
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+
+    <mark_cache_size>5368709120</mark_cache_size>
+
+    <mmap_cache_size>1000</mmap_cache_size>
+
+    <!-- Cache size in bytes for compiled expressions.-->
+    <compiled_expression_cache_size>134217728</compiled_expression_cache_size>
+
+    <!-- Cache size in elements for compiled expressions.-->
+    <compiled_expression_cache_elements_size>10000</compiled_expression_cache_elements_size>
+
+    <!-- Path to data directory, with trailing slash. -->
     <path>/var/lib/clickhouse/</path>
+
+    <!-- Path to temporary data for processing hard queries. -->
     <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+
+    <!-- Directory with user provided files that are accessible by 'file' table function. -->
     <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+
+    <!-- Sources to read users, roles, access rights, profiles of settings, quotas. -->
+    <user_directories>
+        <users_xml>
+            <!-- Path to configuration file with predefined users. -->
+            <path>users.xml</path>
+        </users_xml>
+        <local_directory>
+            <!-- Path to folder where users created by SQL commands are stored. -->
+            <path>/var/lib/clickhouse/access/</path>
+        </local_directory>
+    </user_directories>
+
+    <!-- Default profile of settings. -->
+    <default_profile>default</default_profile>
+
+    <!-- Comma-separated list of prefixes for user-defined settings. -->
+    <custom_settings_prefixes></custom_settings_prefixes>
+
+    <default_database>default</default_database>
+
+    <mlock_executable>true</mlock_executable>
+
+    <!-- Reallocate memory for machine code ("text") using huge pages. Highly experimental. -->
+    <remap_executable>false</remap_executable>
+
+    <!-- Reloading interval for embedded dictionaries, in seconds. Default: 3600. -->
+    <builtin_dictionaries_reload_interval>3600</builtin_dictionaries_reload_interval>
+
+    <!-- Maximum session timeout, in seconds. Default: 3600. -->
+    <max_session_timeout>3600</max_session_timeout>
+
+    <!-- Default session timeout, in seconds. Default: 60. -->
+    <default_session_timeout>60</default_session_timeout>
+    <allow_multiple_instances>1</allow_multiple_instances>
+    <!--
+        Asynchronous metric log contains values of metrics from
+        system.asynchronous_metrics.
+    -->
+    <asynchronous_metric_log>
+        <database>system</database>
+        <table>asynchronous_metric_log</table>
+        <!--
+            Asynchronous metrics are updated once a minute, so there is
+            no need to flush more often.
+        -->
+        <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+    </asynchronous_metric_log>
+    <!-- Configuration of user defined executable functions -->
+    <user_scripts_path>/var/lib/clickhouse/user_scripts/</user_scripts_path>
     <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
-    <access_control_path>/var/lib/clickhouse/access/</access_control_path>
+    <merge_tree_metadata_cache>
+        <lru_cache_size>268435456</lru_cache_size>
+        <continue_if_corrupted>true</continue_if_corrupted>
+    </merge_tree_metadata_cache>
 </clickhouse>
 EOF
 )
 
 CLICKHOUSE_USERS=$(cat <<EOF
+<?xml version="1.0"?>
 <clickhouse>
-    <users>
-        <default>
-            <access_management>1</access_management>
-            <named_collection_control>1</named_collection_control>
-            <show_named_collections>1</show_named_collections>
-            <show_named_collections_secrets>1</show_named_collections_secrets>
-            <profile>default</profile>
-        </default>
-    </users>
     <profiles>
         <default>
-            <async_insert>1</async_insert>
-            <async_insert_max_data_size>2000000</async_insert_max_data_size>
-            <wait_for_async_insert>0</wait_for_async_insert>
-            <parallel_view_processing>1</parallel_view_processing>
-            <materialize_ttl_after_modify>0</materialize_ttl_after_modify>
-            <wait_for_async_insert_timeout>25</wait_for_async_insert_timeout>
+            <max_memory_usage>10000000000</max_memory_usage>
+            <load_balancing>random</load_balancing>
         </default>
+        <readonly>
+            <readonly>1</readonly>
+        </readonly>
     </profiles>
+    <users>
+        <default>
+            <password></password>
+
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <quotas>
+        <default>
+            <interval>
+                <duration>3600</duration>
+                <queries>0</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+        </default>
+    </quotas>
 </clickhouse>
-EOF
-)
-
-CLICKHOUSE_AP=$(aws efs create-access-point \
-    --file-system-id $EFS_ID \
-    --posix-user Uid=999,Gid=999 \
-    --root-directory Path=/clickhouse,CreationInfo="{OwnerUid=999,OwnerGid=999,Permissions=755}" \
-    --tags Key=Name,Value=portkey-clickhouse Key=Environment,Value=${ENVIRONMENT} \
-    --region ${AWS_REGION} | jq -r '.AccessPointId')
-
-NGINX_CONF=$(cat <<EOF
-server {
-    listen 80;
-    server_name localhost;
-    root /usr/share/nginx/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-    
-    location /config.js {
-        alias /usr/share/nginx/html/config.js;
-    }
-
-    location /albus/ {
-        rewrite ^/albus(.*)$ $1 break;
-        proxy_pass http://${BACKEND_ALB_DNS};
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_pass_request_headers on;
-        proxy_method $request_method;
-        proxy_pass_request_body on;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_body $request_body;
-        proxy_buffering off;
-    }
-
-    location /api/ {
-        rewrite ^/api(.*)$ $1 break;
-        proxy_pass http://${GATEWAY_ALB_DNS};
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_pass_request_headers on;
-        proxy_method $request_method;
-        proxy_pass_request_body on;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_body $request_body;
-        proxy_buffering off;
-    }
-
-    error_page 404 /index.html;
-
-    # Additional security headers
-    add_header X-Frame-Options "SAMEORIGIN";
-    add_header X-XSS-Protection "1; mode=block";
-    add_header X-Content-Type-Options "nosniff";
-}
 EOF
 )
 
@@ -450,9 +640,11 @@ EOF
 CLICKHOUSE_CONFIG_B64=$(echo "${CLICKHOUSE_CONFIG}" | base64 -w 0)
 CLICKHOUSE_USERS_B64=$(echo "${CLICKHOUSE_USERS}" | base64 -w 0)
 
-# Write configurations to temporary files
+# Create temporary directory and config files
 TEMP_DIR=$(mktemp -d)
-cat > "${TEMP_DIR}/nginx.conf" << 'NGINX_EOF'
+
+# Define NGINX configuration once
+NGINX_CONF=$(cat <<EOF
 server {
     listen 80;
     server_name localhost;
@@ -460,7 +652,7 @@ server {
     index index.html;
 
     location / {
-        try_files $uri $uri/ /index.html;
+        try_files \$uri \$uri/ /index.html;
     }
     
     location /config.js {
@@ -468,32 +660,32 @@ server {
     }
 
     location /albus/ {
-        rewrite ^/albus(.*)$ $1 break;
-        proxy_pass http://${BACKEND_ALB_DNS};
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        rewrite ^/albus(.*)$ \$1 break;
+        proxy_pass http://${BACKEND_ALB_DNS}:8080;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_pass_request_headers on;
-        proxy_method $request_method;
+        proxy_method \$request_method;
         proxy_pass_request_body on;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_body $request_body;
+        proxy_set_header X-Original-URI \$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_body \$request_body;
         proxy_buffering off;
     }
 
     location /api/ {
-        rewrite ^/api(.*)$ $1 break;
+        rewrite ^/api(.*)$ \$1 break;
         proxy_pass http://${GATEWAY_ALB_DNS};
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_pass_request_headers on;
-        proxy_method $request_method;
+        proxy_method \$request_method;
         proxy_pass_request_body on;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_body $request_body;
+        proxy_set_header X-Original-URI \$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_body \$request_body;
         proxy_buffering off;
     }
 
@@ -504,20 +696,26 @@ server {
     add_header X-XSS-Protection "1; mode=block";
     add_header X-Content-Type-Options "nosniff";
 }
-NGINX_EOF
+EOF
+)
 
-cat > "${TEMP_DIR}/config.js" << CONFIG_EOF
-window.APP_CONFIG = { 
-    VITE_API_URL: "http://${GATEWAY_ALB_DNS}", 
-    VITE_BASE_URL: "/albus", 
-    VITE_PRIVATE_DEPLOYMENT: "ON", 
-    VITE_AUTH_MODE: "NO_AUTH" 
-};
-CONFIG_EOF
+# Write the NGINX configuration to the temp directory
+echo "${NGINX_CONF}" > "${TEMP_DIR}/nginx.conf"
+
+# Write the config.js to the temp directory
+echo "${CONFIG_JS}" > "${TEMP_DIR}/config.js"
 
 # Update the frontend task definition to use base64 encoded configs
-NGINX_CONF_B64=$(base64 -w 0 "${TEMP_DIR}/nginx.conf")
-CONFIG_JS_B64=$(base64 -w 0 "${TEMP_DIR}/config.js")
+# Use platform-independent base64 encoding
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS version
+    NGINX_CONF_B64=$(base64 < "${TEMP_DIR}/nginx.conf" | tr -d '\n')
+    CONFIG_JS_B64=$(base64 < "${TEMP_DIR}/config.js" | tr -d '\n')
+else
+    # GNU/Linux version
+    NGINX_CONF_B64=$(base64 -w 0 "${TEMP_DIR}/nginx.conf")
+    CONFIG_JS_B64=$(base64 -w 0 "${TEMP_DIR}/config.js")
+fi
 
 FRONTEND_TASK_DEFINITION=$(cat <<EOF
 {
@@ -525,7 +723,7 @@ FRONTEND_TASK_DEFINITION=$(cat <<EOF
     "containerDefinitions": [
         {
             "name": "config-init",
-            "image": "amazon/aws-cli:latest",
+            "image": "busybox:latest",
             "essential": false,
             "command": [
                 "sh",
@@ -631,8 +829,238 @@ FRONTEND_TASK_DEFINITION=$(cat <<EOF
 EOF
 )
 
-echo "Frontend Task Definition: ${FRONTEND_TASK_DEFINITION}"
+# Create MySQL Task Definition
+MYSQL_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-mysql",
+    "containerDefinitions": [
+        {
+            "name": "mysql",
+            "image": "docker.io/mysql:8.1",
+            "portMappings": [
+                {
+                    "containerPort": 3306,
+                    "hostPort": 3306,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "MYSQL_ROOT_PASSWORD",
+                    "value": "123456789"
+                },
+                {
+                    "name": "MYSQL_PASSWORD",
+                    "value": "123456789"
+                },
+                {
+                    "name": "MYSQL_DATABASE",
+                    "value": "portkey"
+                },
+                {
+                    "name": "MYSQL_USER",
+                    "value": "default"
+                }
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "mysql-data",
+                    "containerPath": "/var/lib/mysql",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-mysql",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "volumes": [
+        {
+            "name": "mysql-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${MYSQL_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
 
+# Create Clickhouse Task Definition
+CLICKHOUSE_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-clickhouse",
+    "containerDefinitions": [
+        {
+            "name": "clickhouse-config-init",
+            "image": "busybox:latest",
+            "essential": false,
+            "user": "0:0",
+            "command": [
+                "sh",
+                "-c",
+                "mkdir -p /var/lib/clickhouse /var/log/clickhouse-server /var/lib/clickhouse/tmp /var/lib/clickhouse/user_files /var/lib/clickhouse/format_schemas /var/lib/clickhouse/data && chmod -R 777 /var/lib/clickhouse /var/log/clickhouse-server && ls -l /var/lib/clickhouse && mkdir -p /etc/clickhouse-server && echo '${CLICKHOUSE_CONFIG_B64}' | base64 -d > /etc/clickhouse-server/config.xml && echo '${CLICKHOUSE_USERS_B64}' | base64 -d > /etc/clickhouse-server/users.xml && mkdir -p /etc/clickhouse-server/users.d && echo '<yandex><users><default><password>123456789</password><profile>default</profile><quota>default</quota></default></users></yandex>' > /etc/clickhouse-server/users.d/default-user.xml && chown -R 999:999 /etc/clickhouse-server && chmod -R 755 /etc/clickhouse-server"
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/etc/clickhouse-server",
+                    "readOnly": false
+                },
+                {
+                    "sourceVolume": "clickhouse-data",
+                    "containerPath": "/var/lib/clickhouse",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-clickhouse",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "config-init"
+                }
+            }
+        },
+        {
+            "name": "clickhouse",
+            "image": "docker.io/clickhouse/clickhouse-server:latest",
+            "dependsOn": [
+                {
+                    "containerName": "clickhouse-config-init",
+                    "condition": "SUCCESS"
+                }
+            ],
+            "user": "999:999",
+            "portMappings": [
+                {
+                    "containerPort": 8123,
+                    "hostPort": 8123,
+                    "protocol": "tcp"
+                },
+                {
+                    "containerPort": 9000,
+                    "hostPort": 9000,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "CLICKHOUSE_DB",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_USER",
+                    "value": "default"
+                },
+                {
+                    "name": "CLICKHOUSE_PASSWORD",
+                    "value": "123456789"
+                },
+                {
+                    "name": "CLICKHOUSE_LOGGER_ERRORLOG",
+                    "value": "/var/log/clickhouse-server/error.log"
+                }
+            ],
+            "mountPoints": [
+                {
+                    "sourceVolume": "clickhouse-data",
+                    "containerPath": "/var/lib/clickhouse",
+                    "readOnly": false
+                },
+                {
+                    "sourceVolume": "config",
+                    "containerPath": "/etc/clickhouse-server",
+                    "readOnly": false
+                },
+                {
+                    "sourceVolume": "clickhouse-logs",
+                    "containerPath": "/var/log/clickhouse-server",
+                    "readOnly": false
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/portkey-clickhouse",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "volumes": [
+        {
+            "name": "clickhouse-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${CLICKHOUSE_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        },
+        {
+            "name": "config",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${CLICKHOUSE_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        },
+        {
+            "name": "clickhouse-logs",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${CLICKHOUSE_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "2048",
+    "memory": "4096",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+# Create Backend Task Definition
 BACKEND_TASK_DEFINITION=$(cat <<EOF
 {
     "family": "portkey-backend",
@@ -682,7 +1110,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "ALBUS_BASE_URL",
-                    "value": "http://${GATEWAY_ALB_DNS}/albus"
+                    "value": "http://${FRONTEND_ALB_DNS}/albus"
                 },
                 {
                     "name": "ENV",
@@ -690,7 +1118,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "POLYJUICE_FINETUNE_ENDPOINT",
-                    "value": "http://localhost:8081"
+                    "value": "http://${DATASERVICE_ALB_DNS}"
                 },
                 {
                     "name": "LOG_STORE",
@@ -742,7 +1170,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "DB_HOST",
-                    "value": "localhost"
+                    "value": "${MYSQL_NLB_DNS}"
                 },
                 {
                     "name": "DB_PORT",
@@ -750,7 +1178,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "DB_USER",
-                    "value": "root"
+                    "value": "default"
                 },
                 {
                     "name": "DB_PASS",
@@ -758,19 +1186,19 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "DB_NAME",
-                    "value": "portkey_local"
-                },
-                {
-                    "name": "CLICKHOUSE_DATABASE",
-                    "value": "default"
+                    "value": "portkey"
                 },
                 {
                     "name": "CLICKHOUSE_HOST",
-                    "value": "http://localhost"
+                    "value": "${CLICKHOUSE_ALB_DNS}"
                 },
                 {
                     "name": "CLICKHOUSE_PORT",
                     "value": "8123"
+                },
+                {
+                    "name": "CLICKHOUSE_DATABASE",
+                    "value": "default"
                 },
                 {
                     "name": "CLICKHOUSE_NATIVE_PORT",
@@ -783,10 +1211,6 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 {
                     "name": "CLICKHOUSE_PASSWORD",
                     "value": "123456789"
-                },
-                {
-                    "name": "CLICKHOUSE_DB",
-                    "value": "default"
                 },
                 {
                     "name": "CLICKHOUSE_TLS",
@@ -814,134 +1238,184 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                     "awslogs-stream-prefix": "ecs"
                 }
             }
-        },
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "1024",
+    "memory": "4096",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+# Create Gateway Task Definition
+GATEWAY_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-gateway",
+    "containerDefinitions": [
         {
-            "name": "mysql",
-            "image": "docker.io/mysql:8.1",
+            "name": "gateway",
+            "image": "docker.io/portkeyai/gateway_enterprise:1.9.6",
+            "repositoryCredentials": {
+                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
+            },
+            "environment": [
+                {
+                    "name": "PORT",
+                    "value": "80"
+                },
+                {
+                    "name": "LOG_STORE",
+                    "value": "control_plane"
+                },
+                {
+                    "name": "ANALYTICS_STORE",
+                    "value": "control_plane"
+                },
+                {
+                    "name": "PORTKEY_CLIENT_AUTH",
+                    "value": "client_auth-PRIVATE_SEVICE"
+                },
+                {
+                    "name": "PRIVATE_DEPLOYMENT",
+                    "value": "ON"
+                },
+                {
+                    "name": "SERVICE_NAME",
+                    "value": "portkey-gateway"
+                },
+                {
+                    "name": "GATEWAY_CACHE_MODE",
+                    "value": "SELF"
+                },
+                {
+                    "name": "ENV",
+                    "value": "${ENVIRONMENT}"
+                },
+                {
+                    "name": "ALBUS_BASEPATH",
+                    "value": "http://${BACKEND_ALB_DNS}:8080"
+                },
+                {
+                    "name": "CACHE_STORE",
+                    "value": "redis_store"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://${REDIS_NLB_DNS}:6379"
+                },
+                {
+                    "name": "REDIS_TLS_ENABLED",
+                    "value": "false"
+                },
+                {
+                    "name": "REDIS_MODE",
+                    "value": "single"
+                }
+            ],
             "portMappings": [
                 {
-                    "containerPort": 3306,
-                    "hostPort": 3306,
+                    "containerPort": 80,
+                    "hostPort": 80,
                     "protocol": "tcp"
                 }
             ],
-            "essential": false,
-            "environment": [
-                {
-                    "name": "MYSQL_ROOT_PASSWORD",
-                    "value": "$123456789"
-                },
-                {
-                    "name": "MYSQL_PASSWORD",
-                    "value": "$123456789"
-                },
-                {
-                    "name": "MYSQL_DATABASE",
-                    "value": "portkey_local"
-                },
-                {
-                    "name": "MYSQL_USER",
-                    "value": "root"
-                }
-            ],
-            "mountPoints": [
-                {
-                    "sourceVolume": "mysql-data",
-                    "containerPath": "/var/lib/mysql",
-                    "readOnly": false
-                }
-            ],
+            "essential": true,
             "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
-                    "awslogs-group": "/ecs/portkey-mysql",
+                    "awslogs-group": "/ecs/portkey-gateway",
                     "awslogs-region": "${AWS_REGION}",
                     "awslogs-stream-prefix": "ecs"
                 }
             }
-        },
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+# Create Redis Task Definition
+REDIS_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-redis",
+    "containerDefinitions": [
         {
-            "name": "clickhouse-config-init",
-            "image": "amazon/aws-cli:latest",
-            "essential": false,
-            "command": [
-                "sh",
-                "-c",
-                "mkdir -p /config/clickhouse && echo '${CLICKHOUSE_CONFIG_B64}' | base64 -d > /config/clickhouse/config.xml && echo '${CLICKHOUSE_USERS_B64}' | base64 -d > /config/clickhouse/users.xml"
-            ],
-            "mountPoints": [
-                {
-                    "sourceVolume": "config",
-                    "containerPath": "/config",
-                    "readOnly": false
-                }
-            ],
-            "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                    "awslogs-group": "/ecs/portkey-backend",
-                    "awslogs-region": "${AWS_REGION}",
-                    "awslogs-stream-prefix": "clickhouse-config-init"
-                }
-            }
-        },
-        {
-            "name": "clickhouse",
-            "image": "docker.io/clickhouse/clickhouse-server:latest",
-            "dependsOn": [
-                {
-                    "containerName": "clickhouse-config-init",
-                    "condition": "SUCCESS"
-                }
-            ],
+            "name": "redis",
+            "image": "docker.io/redis:alpine",
             "portMappings": [
                 {
-                    "containerPort": 8123,
-                    "hostPort": 8123,
-                    "protocol": "tcp"
-                },
-                {
-                    "containerPort": 9000,
-                    "hostPort": 9000,
+                    "containerPort": 6379,
+                    "hostPort": 6379,
                     "protocol": "tcp"
                 }
             ],
-            "essential": false,
-            "environment": [
-                {
-                    "name": "CLICKHOUSE_DB",
-                    "value": "default"
-                },
-                {
-                    "name": "CLICKHOUSE_USER",
-                    "value": "default"
-                },
-                {
-                    "name": "CLICKHOUSE_PASSWORD",
-                    "value": "123456789"
-                }
-            ],
+            "essential": true,
             "mountPoints": [
                 {
-                    "sourceVolume": "clickhouse-data",
-                    "containerPath": "/var/lib/clickhouse",
+                    "sourceVolume": "redis-data",
+                    "containerPath": "/data",
                     "readOnly": false
-                },
-                {
-                    "sourceVolume": "config",
-                    "containerPath": "/etc/clickhouse-server",
-                    "readOnly": true
                 }
             ],
             "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
-                    "awslogs-group": "/ecs/portkey-clickhouse",
+                    "awslogs-group": "/ecs/portkey-redis",
                     "awslogs-region": "${AWS_REGION}",
                     "awslogs-stream-prefix": "ecs"
                 }
             }
-        },
+        }
+    ],
+    "volumes": [
+        {
+            "name": "redis-data",
+            "efsVolumeConfiguration": {
+                "fileSystemId": "${EFS_ID}",
+                "transitEncryption": "ENABLED",
+                "authorizationConfig": {
+                    "accessPointId": "${REDIS_AP}",
+                    "iam": "ENABLED"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "${TASK_ROLE_ARN}",
+    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    }
+}
+EOF
+)
+
+# Create Data Service Task Definition
+DATA_SERVICE_TASK_DEFINITION=$(cat <<EOF
+{
+    "family": "portkey-dataservice",
+    "containerDefinitions": [
         {
             "name": "dataservice",
             "image": "docker.io/portkeyai/data-service:latest",
@@ -951,7 +1425,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
             "environment": [
                 {
                     "name": "PORT",
-                    "value": "8081"
+                    "value": "80"
                 },
                 {
                     "name": "PRIVATE_DEPLOYMENT",
@@ -1019,7 +1493,7 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
                 },
                 {
                     "name": "CLICKHOUSE_HOST",
-                    "value": "http://localhost"
+                    "value": "${CLICKHOUSE_ALB_DNS}"
                 },
                 {
                     "name": "CLICKHOUSE_PORT",
@@ -1048,135 +1522,6 @@ BACKEND_TASK_DEFINITION=$(cat <<EOF
             ],
             "portMappings": [
                 {
-                    "containerPort": 8081,
-                    "hostPort": 8081,
-                    "protocol": "tcp"
-                }
-            ],
-            "essential": false,
-            "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                    "awslogs-group": "/ecs/portkey-backend",
-                    "awslogs-region": "${AWS_REGION}",
-                    "awslogs-stream-prefix": "dataservice"
-                }
-            }
-        }
-    ],
-    "volumes": [
-        {
-            "name": "mysql-data",
-            "efsVolumeConfiguration": {
-                "fileSystemId": "${EFS_ID}",
-                "transitEncryption": "ENABLED",
-                "authorizationConfig": {
-                    "accessPointId": "${MYSQL_AP}",
-                    "iam": "ENABLED"
-                }
-            }
-        },
-        {
-            "name": "clickhouse-data",
-            "efsVolumeConfiguration": {
-                "fileSystemId": "${EFS_ID}",
-                "transitEncryption": "ENABLED",
-                "authorizationConfig": {
-                    "accessPointId": "${CLICKHOUSE_AP}",
-                    "iam": "ENABLED"
-                }
-            }
-        },
-        {
-            "name": "config"
-        }
-    ],
-    "taskRoleArn": "${TASK_ROLE_ARN}",
-    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
-    "networkMode": "awsvpc",
-    "requiresCompatibilities": ["FARGATE"],
-    "cpu": "1024",
-    "memory": "4096",
-    "runtimePlatform": {
-        "operatingSystemFamily": "LINUX",
-        "cpuArchitecture": "ARM64"
-    }
-}
-EOF
-)
-
-echo "Backend Task Definition: ${BACKEND_TASK_DEFINITION}"
-
-GATEWAY_TASK_DEFINITION=$(cat <<EOF
-{
-    "family": "portkey-gateway",
-    "containerDefinitions": [
-        {
-            "name": "gateway",
-            "image": "docker.io/portkeyai/gateway_enterprise:latest",
-            "repositoryCredentials": {
-                "credentialsParameter": "${DOCKER_CREDENTIALS_SECRET_ARN}"
-            },
-            "environment": [
-                {
-                    "name": "PORT",
-                    "value": "80"
-                },
-                {
-                    "name": "LOG_STORE",
-                    "value": "CONTROL_PLANE"
-                },
-                {
-                    "name": "ANALYTICS_STORE",
-                    "value": "control_plane"
-                },
-                {
-                    "name": "ALBUS_BASE_PATH",
-                    "value": "http://${BACKEND_ALB_DNS}/albus"
-                },
-                {
-                    "name": "PORTKEY_CLIENT_AUTH",
-                    "value": "client-auth-_2jan4_3n3b2:.<fKKfbe"
-                },
-                {
-                    "name": "PRIVATE_DEPLOYMENT",
-                    "value": "ON"
-                },
-                {
-                    "name": "SERVICE_NAME",
-                    "value": "portkey-gateway"
-                },
-                {
-                    "name": "GATEWAY_CACHE_MODE",
-                    "value": "SELF"
-                },
-                {
-                    "name": "ENV",
-                    "value": "${ENVIRONMENT}"
-                },
-                {
-                    "name": "ALBUS_BASEPATH",
-                    "value": "http://${BACKEND_ALB_DNS}/albus"
-                },
-                {
-                    "name": "CACHE_STORE",
-                    "value": "redis_store"
-                },
-                {
-                    "name": "REDIS_URL",
-                    "value": "redis://${REDIS_NLB_DNS}:6379"
-                },
-                {
-                    "name": "REDIS_TLS_ENABLED",
-                    "value": "false"
-                },
-                {
-                    "name": "REDIS_MODE",
-                    "value": "single"
-                }
-            ],
-            "portMappings": [
-                {
                     "containerPort": 80,
                     "hostPort": 80,
                     "protocol": "tcp"
@@ -1186,7 +1531,7 @@ GATEWAY_TASK_DEFINITION=$(cat <<EOF
             "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
-                    "awslogs-group": "/ecs/portkey-gateway",
+                    "awslogs-group": "/ecs/portkey-dataservice",
                     "awslogs-region": "${AWS_REGION}",
                     "awslogs-stream-prefix": "ecs"
                 }
@@ -1207,66 +1552,31 @@ GATEWAY_TASK_DEFINITION=$(cat <<EOF
 EOF
 )
 
-echo "Gateway Task Definition: ${GATEWAY_TASK_DEFINITION}"
+# Create Data Service Target Group
+EXISTING_DATASERVICE_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-dataservice-tg \
+    --region ${AWS_REGION} 2>/dev/null)
 
-REDIS_TASK_DEFINITION=$(cat <<EOF
-{
-    "family": "portkey-redis",
-    "containerDefinitions": [
-        {
-            "name": "redis",
-            "image": "docker.io/redis:alpine",
-            "portMappings": [
-                {
-                    "containerPort": 6379,
-                    "hostPort": 6379,
-                    "protocol": "tcp"
-                }
-            ],
-            "essential": true,
-            "mountPoints": [
-                {
-                    "sourceVolume": "redis-data",
-                    "containerPath": "/data",
-                    "readOnly": false
-                }
-            ],
-            "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                    "awslogs-group": "/ecs/portkey-redis",
-                    "awslogs-region": "${AWS_REGION}",
-                    "awslogs-stream-prefix": "ecs"
-                }
-            }
-        }
-    ],
-    "volumes": [
-        {
-            "name": "redis-data",
-            "efsVolumeConfiguration": {
-                "fileSystemId": "${EFS_ID}",
-                "transitEncryption": "ENABLED",
-                "authorizationConfig": {
-                    "accessPointId": "${REDIS_AP}",
-                    "iam": "ENABLED"
-                }
-            }
-        }
-    ],
-    "taskRoleArn": "${TASK_ROLE_ARN}",
-    "executionRoleArn": "${EXECUTION_ROLE_ARN}",
-    "networkMode": "awsvpc",
-    "requiresCompatibilities": ["FARGATE"],
-    "cpu": "256",
-    "memory": "512",
-    "runtimePlatform": {
-        "operatingSystemFamily": "LINUX",
-        "cpuArchitecture": "ARM64"
-    }
-}
-EOF
-)
+if [ $? -eq 0 ]; then
+    echo "Using existing data service target group..."
+    DATASERVICE_TG_ARN=$(echo $EXISTING_DATASERVICE_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new data service target group..."
+    DATASERVICE_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-dataservice-tg \
+        --protocol HTTP \
+        --port 80 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/health" \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 5 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    DATASERVICE_TG_ARN=$(echo $DATASERVICE_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
 
 echo "Creating CloudWatch log groups..."
 LOG_GROUPS=(
@@ -1275,18 +1585,26 @@ LOG_GROUPS=(
     "/ecs/portkey-backend"
     "/ecs/portkey-redis"
     "/ecs/portkey-clickhouse"
+    "/ecs/portkey-mysql"
+    "/ecs/portkey-dataservice"
 )
 
 for LOG_GROUP in "${LOG_GROUPS[@]}"; do
-    aws logs create-log-group \
-        --log-group-name ${LOG_GROUP} \
-        --region ${AWS_REGION}
-    
-    # Optionally set retention policy (e.g., 14 days)
-    aws logs put-retention-policy \
-        --log-group-name ${LOG_GROUP} \
-        --retention-in-days 14 \
-        --region ${AWS_REGION}
+    # Check if log group exists
+    if aws logs describe-log-groups --log-group-name-prefix ${LOG_GROUP} --region ${AWS_REGION} | grep -q "logGroupName"; then
+        echo "Log group ${LOG_GROUP} already exists"
+    else
+        echo "Creating log group ${LOG_GROUP}"
+        aws logs create-log-group \
+            --log-group-name ${LOG_GROUP} \
+            --region ${AWS_REGION}
+        
+        # Set retention policy for new log groups
+        aws logs put-retention-policy \
+            --log-group-name ${LOG_GROUP} \
+            --retention-in-days 14 \
+            --region ${AWS_REGION}
+    fi
 done
 
 # Register all task definitions
@@ -1317,18 +1635,36 @@ REDIS_TASK_DEF_ARN=$(echo "${REDIS_TASK_DEFINITION}" | \
     --query 'taskDefinition.taskDefinitionArn' \
     --output text)
 
+MYSQL_TASK_DEF_ARN=$(echo "${MYSQL_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+CLICKHOUSE_TASK_DEF_ARN=$(echo "${CLICKHOUSE_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+DATA_SERVICE_TASK_DEF_ARN=$(echo "${DATA_SERVICE_TASK_DEFINITION}" | \
+    aws ecs register-task-definition \
+    --cli-input-json "$(cat -)" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
 echo "Task definitions registered successfully: "
 echo "Frontend: ${FRONTEND_TASK_DEF_ARN}"
 echo "Backend: ${BACKEND_TASK_DEF_ARN}"
 echo "Gateway: ${GATEWAY_TASK_DEF_ARN}"
-echo "Redis: ${REDIS_TASK_DEF_ARN}"
 
 echo "Setting up target groups..."
 
 # Check/Create Frontend Target Group
+echo "Setting up frontend target group..."
 EXISTING_FRONTEND_TG=$(aws elbv2 describe-target-groups \
     --names portkey-frontend-tg \
-    --region ${AWS_REGION} 2>/dev/null)
+    --region ${AWS_REGION})
 
 if [ $? -eq 0 ]; then
     echo "Using existing frontend target group..."
@@ -1352,9 +1688,10 @@ else
 fi
 
 # Check/Create Backend Target Group
+echo "Setting up backend target group..."
 EXISTING_BACKEND_TG=$(aws elbv2 describe-target-groups \
     --names portkey-backend-tg \
-    --region ${AWS_REGION} 2>/dev/null)
+    --region ${AWS_REGION})
 
 if [ $? -eq 0 ]; then
     echo "Using existing backend target group..."
@@ -1364,7 +1701,7 @@ else
     BACKEND_TG_RESPONSE=$(aws elbv2 create-target-group \
         --name portkey-backend-tg \
         --protocol HTTP \
-        --port 80 \
+        --port 8080 \
         --vpc-id ${VPC_ID} \
         --target-type ip \
         --health-check-path "/health" \
@@ -1378,9 +1715,10 @@ else
 fi
 
 # Check/Create Gateway Target Group
+echo "Setting up gateway target group..."
 EXISTING_GATEWAY_TG=$(aws elbv2 describe-target-groups \
     --names portkey-gateway-tg \
-    --region ${AWS_REGION} 2>/dev/null)
+    --region ${AWS_REGION})
 
 if [ $? -eq 0 ]; then
     echo "Using existing gateway target group..."
@@ -1404,9 +1742,10 @@ else
 fi
 
 # Check/Create Redis Target Group
+echo "Setting up redis target group..."
 EXISTING_REDIS_TG=$(aws elbv2 describe-target-groups \
     --names portkey-redis-tg \
-    --region ${AWS_REGION} 2>/dev/null)
+    --region ${AWS_REGION})
 
 if [ $? -eq 0 ]; then
     echo "Using existing redis target group..."
@@ -1429,6 +1768,86 @@ else
     REDIS_TG_ARN=$(echo $REDIS_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
 fi
 
+# Check/Create MySQL Target Group
+echo "Setting up MySQL target group..."
+EXISTING_MYSQL_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-mysql-tg \
+    --region ${AWS_REGION})
+
+if [ $? -eq 0 ]; then
+    echo "Using existing MySQL target group..."
+    MYSQL_TG_ARN=$(echo $EXISTING_MYSQL_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new MySQL target group..."
+    MYSQL_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-mysql-tg \
+        --protocol TCP \
+        --port 3306 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-protocol TCP \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 10 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    MYSQL_TG_ARN=$(echo $MYSQL_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+# Check/Create Clickhouse Target Group
+echo "Setting up Clickhouse target group..."
+EXISTING_CLICKHOUSE_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-clickhouse-tg \
+    --region ${AWS_REGION})
+
+if [ $? -eq 0 ]; then
+    echo "Using existing Clickhouse target group..."
+    CLICKHOUSE_TG_ARN=$(echo $EXISTING_CLICKHOUSE_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new Clickhouse target group..."
+    CLICKHOUSE_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-clickhouse-tg \
+        --protocol HTTP \
+        --port 8123 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/ping" \
+        --health-check-interval-seconds 60 \
+        --health-check-timeout-seconds 30 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    CLICKHOUSE_TG_ARN=$(echo $CLICKHOUSE_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
+
+# Check/Create Data Service Target Group
+echo "Setting up data service target group..."
+EXISTING_DATASERVICE_TG=$(aws elbv2 describe-target-groups \
+    --names portkey-dataservice-tg \
+    --region ${AWS_REGION})
+
+if [ $? -eq 0 ]; then
+    echo "Using existing data service target group..."
+    DATASERVICE_TG_ARN=$(echo $EXISTING_DATASERVICE_TG | jq -r '.TargetGroups[0].TargetGroupArn')
+else
+    echo "Creating new data service target group..."
+    DATASERVICE_TG_RESPONSE=$(aws elbv2 create-target-group \
+        --name portkey-dataservice-tg \
+        --protocol HTTP \
+        --port 80 \
+        --vpc-id ${VPC_ID} \
+        --target-type ip \
+        --health-check-path "/health" \
+        --health-check-interval-seconds 30 \
+        --health-check-timeout-seconds 5 \
+        --healthy-threshold-count 2 \
+        --unhealthy-threshold-count 3 \
+        --region ${AWS_REGION})
+
+    DATASERVICE_TG_ARN=$(echo $DATASERVICE_TG_RESPONSE | jq -r '.TargetGroups[0].TargetGroupArn')
+fi
 
 # Create listeners for each ALB
 echo "Creating ALB listeners..."
@@ -1445,7 +1864,7 @@ aws elbv2 create-listener \
 aws elbv2 create-listener \
     --load-balancer-arn ${BACKEND_ALB_ARN} \
     --protocol HTTP \
-    --port 80 \
+    --port 8080 \
     --default-actions Type=forward,TargetGroupArn=${BACKEND_TG_ARN} \
     --region ${AWS_REGION}
 
@@ -1465,48 +1884,245 @@ aws elbv2 create-listener \
     --default-actions Type=forward,TargetGroupArn=${REDIS_TG_ARN} \
     --region ${AWS_REGION}
 
+# Create MySQL and Clickhouse NLB listeners
+aws elbv2 create-listener \
+    --load-balancer-arn ${MYSQL_NLB_ARN} \
+    --protocol TCP \
+    --port 3306 \
+    --default-actions Type=forward,TargetGroupArn=${MYSQL_TG_ARN} \
+    --region ${AWS_REGION}
+
+# Create Data Service Listener
+aws elbv2 create-listener \
+    --load-balancer-arn ${DATASERVICE_ALB_ARN} \
+    --protocol HTTP \
+    --port 80 \
+    --default-actions Type=forward,TargetGroupArn=${DATASERVICE_TG_ARN} \
+    --region ${AWS_REGION}
+
+# Create Clickhouse ALB listener
+aws elbv2 create-listener \
+    --load-balancer-arn ${CLICKHOUSE_ALB_ARN} \
+    --protocol HTTP \
+    --port 8123 \
+    --default-actions Type=forward,TargetGroupArn=${CLICKHOUSE_TG_ARN} \
+    --region ${AWS_REGION}
+
 echo "Waiting for listeners to be active..."
 sleep 10
 
-# Create ECS services
-aws ecs create-service \
+# Create or update Frontend service
+echo "Deploying frontend service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
     --cluster ${CLUSTER_NAME} \
-    --service-name portkey-frontend \
-    --task-definition ${FRONTEND_TASK_DEF_ARN} \
-    --desired-count 1 \
-    --launch-type FARGATE \
-    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
-    --load-balancers "targetGroupArn=${FRONTEND_TG_ARN},containerName=frontend,containerPort=80"
+    --services "portkey-frontend" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
 
-aws ecs create-service \
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing frontend service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-frontend" \
+        --task-definition ${FRONTEND_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new frontend service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-frontend" \
+        --task-definition ${FRONTEND_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${FRONTEND_TG_ARN},containerName=frontend,containerPort=80" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update Backend service
+echo "Deploying backend service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
     --cluster ${CLUSTER_NAME} \
-    --service-name portkey-backend \
-    --task-definition ${BACKEND_TASK_DEF_ARN} \
-    --desired-count 1 \
-    --launch-type FARGATE \
-    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
-    --load-balancers "targetGroupArn=${BACKEND_TG_ARN},containerName=backend,containerPort=8080"
+    --services "portkey-backend" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
 
-aws ecs create-service \
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing backend service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-backend" \
+        --task-definition ${BACKEND_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new backend service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-backend" \
+        --task-definition ${BACKEND_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${BACKEND_TG_ARN},containerName=backend,containerPort=8080" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update Gateway service
+echo "Deploying gateway service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
     --cluster ${CLUSTER_NAME} \
-    --service-name portkey-gateway \
-    --task-definition ${GATEWAY_TASK_DEF_ARN} \
-    --desired-count 1 \
-    --launch-type FARGATE \
-    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
-    --load-balancers "targetGroupArn=${GATEWAY_TG_ARN},containerName=gateway,containerPort=80"
+    --services "portkey-gateway" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
 
-aws ecs create-service \
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing gateway service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-gateway" \
+        --task-definition ${GATEWAY_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new gateway service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-gateway" \
+        --task-definition ${GATEWAY_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${GATEWAY_TG_ARN},containerName=gateway,containerPort=80" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update Redis service
+echo "Deploying redis service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
     --cluster ${CLUSTER_NAME} \
-    --service-name portkey-redis \
-    --task-definition ${REDIS_TASK_DEF_ARN} \
-    --desired-count 1 \
-    --launch-type FARGATE \
-    --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
-    --load-balancers "targetGroupArn=${REDIS_TG_ARN},containerName=redis,containerPort=6379"
+    --services "portkey-redis" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
 
-# Update resources JSON file to include data-service
-cat <<EOF > portkey-resources.json
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing redis service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-redis" \
+        --task-definition ${REDIS_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new redis service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-redis" \
+        --task-definition ${REDIS_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${REDIS_TG_ARN},containerName=redis,containerPort=6379" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update MySQL service
+echo "Deploying MySQL service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
+    --cluster ${CLUSTER_NAME} \
+    --services "portkey-mysql" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
+
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing MySQL service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-mysql" \
+        --task-definition ${MYSQL_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new MySQL service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-mysql" \
+        --task-definition ${MYSQL_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${MYSQL_TG_ARN},containerName=mysql,containerPort=3306" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update Clickhouse service
+echo "Deploying Clickhouse service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
+    --cluster ${CLUSTER_NAME} \
+    --services "portkey-clickhouse" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
+
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing Clickhouse service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-clickhouse" \
+        --task-definition ${CLICKHOUSE_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new Clickhouse service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-clickhouse" \
+        --task-definition ${CLICKHOUSE_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${CLICKHOUSE_TG_ARN},containerName=clickhouse,containerPort=8123" \
+        --region ${AWS_REGION}
+fi
+
+# Create or update Data Service
+echo "Deploying data service..."
+SERVICE_EXISTS=$(aws ecs describe-services \
+    --cluster ${CLUSTER_NAME} \
+    --services "portkey-dataservice" \
+    --region ${AWS_REGION} \
+    --query 'services[0].status' \
+    --output text)
+
+if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+    echo "Updating existing data service..."
+    aws ecs update-service \
+        --cluster ${CLUSTER_NAME} \
+        --service "portkey-dataservice" \
+        --task-definition ${DATA_SERVICE_TASK_DEF_ARN} \
+        --force-new-deployment \
+        --region ${AWS_REGION}
+else
+    echo "Creating new data service..."
+    aws ecs create-service \
+        --cluster ${CLUSTER_NAME} \
+        --service-name "portkey-dataservice" \
+        --task-definition ${DATA_SERVICE_TASK_DEF_ARN} \
+        --desired-count 1 \
+        --launch-type FARGATE \
+        --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":${SUBNET_LIST_JSON},\"securityGroups\":[\"${PORTKEY_SECURITY_GROUP}\"],\"assignPublicIp\":\"ENABLED\"}}" \
+        --load-balancers "targetGroupArn=${DATASERVICE_TG_ARN},containerName=dataservice,containerPort=80" \
+        --region ${AWS_REGION}
+fi
+
+# Update resources.json to include data service
+cat > portkey-resources.json << EOF
 {
     "cluster_name": "${CLUSTER_NAME}",
     "security_groups": {
@@ -1525,23 +2141,37 @@ cat <<EOF > portkey-resources.json
         "frontend": "${FRONTEND_TG_ARN}",
         "backend": "${BACKEND_TG_ARN}",
         "gateway": "${GATEWAY_TG_ARN}",
-        "redis": "${REDIS_TG_ARN}"
+        "redis": "${REDIS_TG_ARN}",
+        "mysql": "${MYSQL_TG_ARN}",
+        "clickhouse": "${CLICKHOUSE_TG_ARN}",
+        "dataservice": "${DATASERVICE_TG_ARN}"
     },
     "load_balancers": {
         "frontend": "${FRONTEND_ALB_ARN}",
         "backend": "${BACKEND_ALB_ARN}",
         "gateway": "${GATEWAY_ALB_ARN}",
-        "redis": "${REDIS_NLB_ARN}"
+        "redis": "${REDIS_NLB_ARN}",
+        "mysql": "${MYSQL_NLB_ARN}",
+        "clickhouse": "${CLICKHOUSE_ALB_ARN}",
+        "dataservice": "${DATASERVICE_ALB_ARN}"
     },
     "load_balancer_dns": {
         "frontend": "${FRONTEND_ALB_DNS}",
         "backend": "${BACKEND_ALB_DNS}",
         "gateway": "${GATEWAY_ALB_DNS}",
-        "redis": "${REDIS_NLB_DNS}"
+        "redis": "${REDIS_NLB_DNS}",
+        "mysql": "${MYSQL_NLB_DNS}",
+        "clickhouse": "${CLICKHOUSE_ALB_DNS}",
+        "dataservice": "${DATASERVICE_ALB_DNS}"
     },
-    "log_groups": "${LOG_GROUPS[@]}",
-    "docker_credentials_secret": "${DOCKER_CREDENTIALS_SECRET_ARN}",
-    "region": "${AWS_REGION}",
+    "log_groups": [
+        "/ecs/portkey-frontend",
+        "/ecs/portkey-gateway",
+        "/ecs/portkey-backend",
+        "/ecs/portkey-redis",
+        "/ecs/portkey-clickhouse",
+        "/ecs/portkey-mysql"
+    ],
     "s3_bucket": {
         "name": "${BUCKET_NAME}",
         "arn": "arn:aws:s3:::${BUCKET_NAME}"
@@ -1554,7 +2184,6 @@ echo "Load Balancer DNS Names:"
 echo "Frontend: ${FRONTEND_ALB_DNS}"
 echo "Backend: ${BACKEND_ALB_DNS}"
 echo "Gateway: ${GATEWAY_ALB_DNS}"
-echo "Redis: ${REDIS_NLB_DNS}"
 
 # Clean up temp directory
 rm -rf "${TEMP_DIR}"
